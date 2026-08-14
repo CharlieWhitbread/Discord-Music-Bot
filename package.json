@@ -11,11 +11,14 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@discordjs/opus": "^0.9.0",
     "@discordjs/voice": "^0.18.0",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
     "ffmpeg-static": "^5.2.0",
-    "libsodium-wrappers": "^0.7.15"
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.1.1"
+  },
+  "optionalDependencies": {
+    "@discordjs/opus": "^0.9.0"
   }
 }
