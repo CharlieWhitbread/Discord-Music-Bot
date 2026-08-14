@@ -19,6 +19,7 @@
  */
 
 const { spawn } = require('node:child_process');
+const { PassThrough } = require('node:stream');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -36,12 +37,19 @@ const config = require('../config');
 /** @type {Map<string, Session>} guildId → active session */
 const sessions = new Map();
 
+// 20 ms of s16le silence at 48 kHz stereo: 48000 * 2ch * 2B * 0.02
+const SILENCE_FRAME = Buffer.alloc(3840);
+// Inject silence if no real PCM arrived within this window (Spotify paused).
+const SILENCE_AFTER_MS = 200;
+
 /**
  * @typedef {object} Session
  * @property {import('@discordjs/voice').VoiceConnection} connection
  * @property {import('@discordjs/voice').AudioPlayer} player
  * @property {import('node:child_process').ChildProcess|null} librespot
  * @property {import('node:child_process').ChildProcess|null} ffmpeg
+ * @property {import('node:stream').PassThrough|null} output
+ * @property {NodeJS.Timeout|null} silenceTimer
  * @property {boolean} destroyed  Guard flag making destroySession idempotent.
  */
 
@@ -128,6 +136,8 @@ async function createSession(voiceChannel) {
     player: null,
     librespot: null,
     ffmpeg: null,
+    output: null,
+    silenceTimer: null,
     destroyed: false,
   };
   sessions.set(guildId, session);
@@ -175,20 +185,42 @@ async function createSession(voiceChannel) {
       }
     });
 
-    /* 3 ─ Build player + resource from ffmpeg stdout */
+    /* 3 ─ Build player + resource from a persistent, silence-padded stream.
+     *
+     * The resource must NOT read ffmpeg.stdout directly: when Spotify is
+     * paused, librespot stops writing PCM, the player would go Idle and
+     * @discordjs/voice would destroy the stream — breaking ffmpeg's pipe and
+     * killing the whole session. Instead, ffmpeg writes into a PassThrough
+     * we own, and a timer injects silence frames whenever real audio stops,
+     * so the player never goes idle across pauses and track gaps. */
+    session.output = new PassThrough({ highWaterMark: 1 << 16 });
+    session.output.on('error', (err) => {
+      console.error(`[output:${guildId}] stream error: ${err.message}`);
+    });
+
+    let lastDataAt = Date.now();
+    session.ffmpeg.stdout.on('data', (chunk) => {
+      lastDataAt = Date.now();
+      if (!session.destroyed) session.output.write(chunk);
+    });
+
+    session.silenceTimer = setInterval(() => {
+      if (!session.destroyed && Date.now() - lastDataAt > SILENCE_AFTER_MS) {
+        session.output.write(SILENCE_FRAME);
+      }
+    }, 20);
+
     session.player = createAudioPlayer({
       behaviors: {
         // Keep decoding even if nobody is connected; Spotify keeps playing.
         noSubscriber: NoSubscriberBehavior.Play,
-        // librespot emits silence gaps between tracks; a generous threshold
-        // stops the player from flapping between Idle and Playing.
         maxMissedFrames: Math.round(5000 / 20),
       },
     });
 
     wirePlayerEvents(session, guildId);
 
-    const resource = createAudioResource(session.ffmpeg.stdout, {
+    const resource = createAudioResource(session.output, {
       inputType: StreamType.Raw, // s16le / 48 kHz / stereo
       silencePaddingFrames: 5,
     });
@@ -220,10 +252,16 @@ function destroySession(guildId) {
 
   console.log(`[session:${guildId}] tearing down`);
 
+  if (session.silenceTimer) clearInterval(session.silenceTimer);
+
   // Stop the player first so @discordjs/voice releases the stream.
   try {
     session.player?.stop(true);
   } catch { /* already stopped */ }
+
+  try {
+    session.output?.destroy();
+  } catch { /* stream already closed */ }
 
   // Unpipe before killing to avoid write-after-end errors.
   try {
