@@ -199,13 +199,20 @@ async function createSession(voiceChannel) {
     });
 
     let lastDataAt = Date.now();
-    session.ffmpeg.stdout.on('data', (chunk) => {
+    // Passive listener: only timestamps arrivals. The actual data transfer
+    // goes through pipe() so backpressure reaches librespot — the pipe
+    // backend has no clock and relies on the consumer for realtime pacing.
+    session.ffmpeg.stdout.on('data', () => {
       lastDataAt = Date.now();
-      if (!session.destroyed) session.output.write(chunk);
     });
+    session.ffmpeg.stdout.pipe(session.output, { end: false });
 
     session.silenceTimer = setInterval(() => {
-      if (!session.destroyed && Date.now() - lastDataAt > SILENCE_AFTER_MS) {
+      if (
+        !session.destroyed &&
+        Date.now() - lastDataAt > SILENCE_AFTER_MS &&
+        session.output.readableLength === 0 // only when the player has drained real audio
+      ) {
         session.output.write(SILENCE_FRAME);
       }
     }, 20);
@@ -266,6 +273,7 @@ function destroySession(guildId) {
   // Unpipe before killing to avoid write-after-end errors.
   try {
     session.librespot?.stdout?.unpipe();
+    session.ffmpeg?.stdout?.unpipe();
   } catch { /* stream already closed */ }
 
   killProcess(session.librespot, 'librespot');
