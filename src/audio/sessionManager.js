@@ -144,6 +144,14 @@ async function createSession(voiceChannel) {
 
     wireConnectionEvents(session, guildId);
 
+    // Verbose state logging to diagnose handshake failures.
+    session.connection.on('stateChange', (oldState, newState) => {
+      console.log(`[connection:${guildId}] ${oldState.status} -> ${newState.status}`);
+    });
+    session.connection.on('debug', (msg) => {
+      console.log(`[connection:${guildId}] debug: ${msg}`);
+    });
+
     // Fail fast if the gateway handshake doesn't complete.
     await entersState(session.connection, VoiceConnectionStatus.Ready, 20_000);
 

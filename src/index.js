@@ -6,8 +6,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { Client, Collection, GatewayIntentBits, Events, MessageFlags } = require('discord.js');
+const { generateDependencyReport } = require('@discordjs/voice');
 const config = require('./config');
 const sessionManager = require('./audio/sessionManager');
+
+// Shows which opus/encryption/DAVE libraries @discordjs/voice detected.
+console.log(generateDependencyReport());
 
 const client = new Client({
   intents: [
