@@ -4,6 +4,7 @@ import { ADMIN_USER } from './config';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
 import type { BotStatus, Clip, ConnectionState, User } from './types';
+import { formatTag } from './format';
 import Login from './components/Login';
 import StatusBanner from './components/StatusBanner';
 import SoundboardGrid from './components/SoundboardGrid';
@@ -150,7 +151,7 @@ export default function App() {
                   className={`tag-chip${activeTags.includes(tag) ? ' active' : ''}`}
                   onClick={() => toggleTag(tag)}
                 >
-                  {tag}
+                  {formatTag(tag)}
                 </button>
               ))}
               {activeTags.length > 0 && (

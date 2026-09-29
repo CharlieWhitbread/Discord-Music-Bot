@@ -1,4 +1,5 @@
 import type { Clip } from '../types';
+import { formatTag } from '../format';
 
 function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
@@ -45,12 +46,12 @@ export default function SoundboardGrid({
           {clip.tags.length > 0 && (
             <span className="tile-tags">
               {clip.tags.map((tag) => (
-                <span key={tag} className="tag-badge">{tag}</span>
+                <span key={tag} className="tag-badge">{formatTag(tag)}</span>
               ))}
             </span>
           )}
           <span className="tile-meta">
-            {formatDuration(clip.durationMs)} · {clip.playCount}▶
+            {formatDuration(clip.durationMs)} · {clip.playCount} ▶
           </span>
           {(isAdmin || clip.uploaderId === currentUserId) && (
             <>

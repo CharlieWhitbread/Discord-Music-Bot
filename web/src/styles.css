@@ -343,8 +343,8 @@ body {
 .filter-bar {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin: 12px 0 4px;
+  gap: 10px;
+  margin: 12px 0 10px;
 }
 .search-input {
   background: var(--panel);
