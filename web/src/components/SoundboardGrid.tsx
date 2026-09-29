@@ -9,7 +9,9 @@ export default function SoundboardGrid({
   nowPlayingId,
   disabled,
   currentUserId,
+  isAdmin,
   onPlay,
+  onEdit,
   onDelete,
   emptyMessage = 'No clips yet — add the first one!',
 }: {
@@ -17,7 +19,9 @@ export default function SoundboardGrid({
   nowPlayingId: number | null;
   disabled: boolean;
   currentUserId: string;
+  isAdmin: boolean;
   onPlay: (clip: Clip) => void;
+  onEdit: (clip: Clip) => void;
   onDelete: (clip: Clip) => void;
   emptyMessage?: string;
 }) {
@@ -48,15 +52,25 @@ export default function SoundboardGrid({
           <span className="tile-meta">
             {formatDuration(clip.durationMs)} · {clip.playCount}▶
           </span>
-          {clip.uploaderId === currentUserId && (
-            <span
-              className="tile-delete"
-              role="button"
-              title="Delete clip"
-              onClick={(e) => { e.stopPropagation(); onDelete(clip); }}
-            >
-              ✕
-            </span>
+          {(isAdmin || clip.uploaderId === currentUserId) && (
+            <>
+              <span
+                className="tile-edit"
+                role="button"
+                title="Edit clip"
+                onClick={(e) => { e.stopPropagation(); onEdit(clip); }}
+              >
+                ✎
+              </span>
+              <span
+                className="tile-delete"
+                role="button"
+                title="Delete clip"
+                onClick={(e) => { e.stopPropagation(); onDelete(clip); }}
+              >
+                ✕
+              </span>
+            </>
           )}
         </button>
       ))}

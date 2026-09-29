@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from './api';
+import { ADMIN_USER } from './config';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
 import type { BotStatus, Clip, ConnectionState, User } from './types';
@@ -7,6 +8,7 @@ import Login from './components/Login';
 import StatusBanner from './components/StatusBanner';
 import SoundboardGrid from './components/SoundboardGrid';
 import UploadModal from './components/UploadModal';
+import EditClipModal from './components/EditClipModal';
 
 export default function App() {
   const [loginError] = useState<string | null>(() => captureTokenFromUrl());
@@ -16,6 +18,7 @@ export default function App() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [wsState, setWsState] = useState<ConnectionState>('closed');
   const [showUpload, setShowUpload] = useState(false);
+  const [editClip, setEditClip] = useState<Clip | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [activeTags, setActiveTags] = useState<string[]>([]);
@@ -165,7 +168,9 @@ export default function App() {
         nowPlayingId={status?.clip?.id ?? null}
         disabled={!status?.inVoice}
         currentUserId={user.userId}
+        isAdmin={ADMIN_USER != null && user.userId === ADMIN_USER}
         onPlay={playClip}
+        onEdit={setEditClip}
         onDelete={deleteClip}
         emptyMessage={clips.length > 0 ? 'No clips match your search' : undefined}
       />
@@ -174,6 +179,14 @@ export default function App() {
         <UploadModal
           onClose={() => setShowUpload(false)}
           onUploaded={() => { setShowUpload(false); refreshClips(); }}
+        />
+      )}
+
+      {editClip && (
+        <EditClipModal
+          clip={editClip}
+          onClose={() => setEditClip(null)}
+          onSaved={() => { setEditClip(null); refreshClips(); }}
         />
       )}
 

@@ -51,8 +51,9 @@ const config = {
     clientSecret: process.env.DISCORD_CLIENT_SECRET?.trim() || null,
     // Set to 'true' to skip auth entirely (LAN development only!).
     authDisabled: (process.env.AUTH_DISABLED ?? 'false').toLowerCase() === 'true',
-    // Comma-separated Discord user ids allowed to delete any clip.
-    adminIds: (process.env.ADMIN_USER_IDS ?? '')
+    // Comma-separated Discord user ids allowed to manage any clip
+    // (ADMIN_USER accepted as a single-id alias).
+    adminIds: (process.env.ADMIN_USER_IDS ?? process.env.ADMIN_USER ?? '')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),

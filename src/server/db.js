@@ -63,7 +63,7 @@ const stmts = {
   deleteClip: db.prepare('DELETE FROM clips WHERE id = ?'),
   bumpPlayCount: db.prepare('UPDATE clips SET play_count = play_count + 1 WHERE id = ?'),
   countClips: db.prepare('SELECT COUNT(*) AS n FROM clips'),
-  updateClipTags: db.prepare('UPDATE clips SET tags = ? WHERE id = ?'),
+  updateClipMeta: db.prepare('UPDATE clips SET name = @name, emoji = @emoji, tags = @tags WHERE id = @id'),
 };
 
 function insertClip(fields) {
@@ -92,8 +92,8 @@ function bumpPlayCount(id) {
   stmts.bumpPlayCount.run(id);
 }
 
-function updateClipTags(id, tagsJson) {
-  stmts.updateClipTags.run(tagsJson, id);
+function updateClipMeta(id, fields) {
+  stmts.updateClipMeta.run({ id, ...fields });
 }
 
 function countClips() {
@@ -134,7 +134,7 @@ module.exports = {
   findClipByName,
   deleteClip,
   bumpPlayCount,
-  updateClipTags,
+  updateClipMeta,
   countClips,
   insertToken,
   getToken,

@@ -161,7 +161,7 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
   }
 });
 
-/* PATCH /api/clips/:id — update tags (uploader or admin) */
+/* PATCH /api/clips/:id — update name/emoji/tags (uploader or admin) */
 router.patch('/:id', requireAuth, express.json(), (req, res) => {
   const clip = db.getClip(Number(req.params.id));
   if (!clip) {
@@ -172,8 +172,39 @@ router.patch('/:id', requireAuth, express.json(), (req, res) => {
     res.status(403).json({ error: 'Only the uploader or an admin can edit this clip' });
     return;
   }
-  const tags = parseTags(Array.isArray(req.body?.tags) ? req.body.tags.join(',') : req.body?.tags);
-  db.updateClipTags(clip.id, tags.length ? JSON.stringify(tags) : null);
+
+  const updates = {};
+  if (req.body?.name !== undefined) {
+    const name = String(req.body.name).trim().slice(0, 64);
+    if (!name) {
+      res.status(400).json({ error: 'A clip name is required' });
+      return;
+    }
+    const existing = db.findClipByName(name);
+    if (existing && existing.id !== clip.id && existing.name.toLowerCase() === name.toLowerCase()) {
+      res.status(409).json({ error: 'A clip with that name already exists' });
+      return;
+    }
+    updates.name = name;
+  }
+  if (req.body?.emoji !== undefined) {
+    updates.emoji = String(req.body.emoji ?? '').trim().slice(0, 8) || null;
+  }
+  if (req.body?.tags !== undefined) {
+    const tags = parseTags(Array.isArray(req.body.tags) ? req.body.tags.join(',') : req.body.tags);
+    updates.tags = tags.length ? JSON.stringify(tags) : null;
+  }
+  if (Object.keys(updates).length === 0) {
+    res.status(400).json({ error: 'Nothing to update' });
+    return;
+  }
+
+  db.updateClipMeta(clip.id, {
+    name: clip.name,
+    emoji: clip.emoji,
+    tags: clip.tags,
+    ...updates,
+  });
   res.json(toClipJson(db.getClip(clip.id)));
 });
 

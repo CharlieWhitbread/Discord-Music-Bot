@@ -37,6 +37,12 @@ export const api = {
   play: (clipId: number) => request<{ ok: true }>(`/api/play/${clipId}`, { method: 'POST' }),
   stop: () => request<{ ok: true }>('/api/stop', { method: 'POST' }),
   deleteClip: (clipId: number) => request<void>(`/api/clips/${clipId}`, { method: 'DELETE' }),
+  updateClip: (clipId: number, fields: { name?: string; emoji?: string; tags?: string }) =>
+    request<Clip>(`/api/clips/${clipId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fields),
+    }),
   clipAudioUrl: (clipId: number) => `${API_BASE}/api/clips/${clipId}/audio`,
   upload: (form: FormData) =>
     request<Clip>('/api/clips', { method: 'POST', body: form }),

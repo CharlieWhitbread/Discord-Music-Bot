@@ -186,7 +186,8 @@ body {
 }
 .tile-meta { font-size: 0.75rem; color: var(--muted); }
 
-.tile-delete {
+.tile-delete,
+.tile-edit {
   position: absolute;
   top: 6px;
   right: 8px;
@@ -196,9 +197,11 @@ body {
   opacity: 0;
   transition: opacity 120ms ease, color 120ms ease;
 }
-.tile:hover .tile-delete { opacity: 1; }
+.tile-edit { left: 8px; right: auto; }
+.tile:hover .tile-delete, .tile:hover .tile-edit { opacity: 1; }
 .tile-delete:hover { color: var(--danger); }
-@media (hover: none) { .tile-delete { opacity: 1; } }
+.tile-edit:hover { color: var(--accent); }
+@media (hover: none) { .tile-delete, .tile-edit { opacity: 1; } }
 
 .empty { color: var(--muted); text-align: center; margin-top: 56px; font-size: 1.05rem; }
 
