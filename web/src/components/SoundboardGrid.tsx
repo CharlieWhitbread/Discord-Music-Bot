@@ -11,6 +11,7 @@ export default function SoundboardGrid({
   currentUserId,
   onPlay,
   onDelete,
+  emptyMessage = 'No clips yet — add the first one!',
 }: {
   clips: Clip[];
   nowPlayingId: number | null;
@@ -18,9 +19,10 @@ export default function SoundboardGrid({
   currentUserId: string;
   onPlay: (clip: Clip) => void;
   onDelete: (clip: Clip) => void;
+  emptyMessage?: string;
 }) {
   if (clips.length === 0) {
-    return <p className="empty">No clips yet — add the first one!</p>;
+    return <p className="empty">{emptyMessage}</p>;
   }
 
   return (
@@ -36,6 +38,13 @@ export default function SoundboardGrid({
         >
           <span className="tile-emoji">{clip.emoji ?? '🔊'}</span>
           <span className="tile-name">{clip.name}</span>
+          {clip.tags.length > 0 && (
+            <span className="tile-tags">
+              {clip.tags.map((tag) => (
+                <span key={tag} className="tag-badge">{tag}</span>
+              ))}
+            </span>
+          )}
           <span className="tile-meta">
             {formatDuration(clip.durationMs)} · {clip.playCount}▶
           </span>

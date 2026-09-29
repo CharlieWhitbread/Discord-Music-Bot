@@ -3,6 +3,7 @@ export interface Clip {
   name: string;
   emoji: string | null;
   color: string | null;
+  tags: string[];
   durationMs: number;
   uploaderId: string;
   uploaderName: string;

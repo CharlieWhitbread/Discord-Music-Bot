@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
@@ -17,6 +17,8 @@ export default function App() {
   const [wsState, setWsState] = useState<ConnectionState>('closed');
   const [showUpload, setShowUpload] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [activeTags, setActiveTags] = useState<string[]>([]);
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -75,6 +77,25 @@ export default function App() {
       .catch((err) => notify(err.message));
   }, [refreshClips, notify]);
 
+  const allTags = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const clip of clips) {
+      for (const tag of clip.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+    }
+    return [...counts.keys()].sort((a, b) => (counts.get(b)! - counts.get(a)!) || a.localeCompare(b));
+  }, [clips]);
+
+  const toggleTag = (tag: string) =>
+    setActiveTags((cur) => (cur.includes(tag) ? cur.filter((t) => t !== tag) : [...cur, tag]));
+
+  const visibleClips = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return clips.filter((clip) =>
+      activeTags.every((tag) => clip.tags.includes(tag)) &&
+      (!q || clip.name.toLowerCase().includes(q) || clip.tags.some((tag) => tag.includes(q))),
+    );
+  }, [clips, query, activeTags]);
+
   if (!authChecked) return null;
 
   if (!user) {
@@ -109,13 +130,44 @@ export default function App() {
 
       <StatusBanner status={status} wsState={wsState} />
 
+      {(clips.length > 0) && (
+        <div className="filter-bar">
+          <input
+            type="search"
+            className="search-input"
+            placeholder="Search clips…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {allTags.length > 0 && (
+            <div className="tag-chips">
+              {allTags.map((tag) => (
+                <button
+                  key={tag}
+                  className={`tag-chip${activeTags.includes(tag) ? ' active' : ''}`}
+                  onClick={() => toggleTag(tag)}
+                >
+                  {tag}
+                </button>
+              ))}
+              {activeTags.length > 0 && (
+                <button className="tag-chip clear" onClick={() => setActiveTags([])}>
+                  ✕ clear
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <SoundboardGrid
-        clips={clips}
+        clips={visibleClips}
         nowPlayingId={status?.clip?.id ?? null}
         disabled={!status?.inVoice}
         currentUserId={user.userId}
         onPlay={playClip}
         onDelete={deleteClip}
+        emptyMessage={clips.length > 0 ? 'No clips match your search' : undefined}
       />
 
       {showUpload && (

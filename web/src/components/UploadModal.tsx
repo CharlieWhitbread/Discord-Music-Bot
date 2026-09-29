@@ -32,6 +32,7 @@ export default function UploadModal({
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState('');
+  const [tags, setTags] = useState('');
   const [range, setRange] = useState<{ start: number; end: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [previewing, setPreviewing] = useState(false);
@@ -247,6 +248,7 @@ export default function UploadModal({
       }
       form.append('name', name.trim());
       if (emoji.trim()) form.append('emoji', emoji.trim());
+      if (tags.trim()) form.append('tags', tags.trim());
       await api.upload(form);
       onUploaded();
     } catch (err) {
@@ -368,6 +370,15 @@ export default function UploadModal({
             onChange={(e) => setEmoji(e.target.value)}
           />
         </div>
+
+        <input
+          type="text"
+          className="tags-input"
+          placeholder="Tags (comma separated, e.g. memes, boo)"
+          maxLength={200}
+          value={tags}
+          onChange={(e) => setTags(e.target.value)}
+        />
 
         {error && <p className="modal-error">{error}</p>}
 

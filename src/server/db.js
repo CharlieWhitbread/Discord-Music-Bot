@@ -43,12 +43,18 @@ db.exec(`
   );
 `);
 
+// Migration for databases created before tags existed.
+const clipCols = db.prepare('PRAGMA table_info(clips)').all().map((c) => c.name);
+if (!clipCols.includes('tags')) {
+  db.exec('ALTER TABLE clips ADD COLUMN tags TEXT');
+}
+
 /* ─────────────────────────── clips ─────────────────────────── */
 
 const stmts = {
   insertClip: db.prepare(`
-    INSERT INTO clips (name, emoji, color, duration_ms, uploader_id, uploader_name, created_at)
-    VALUES (@name, @emoji, @color, @durationMs, @uploaderId, @uploaderName, @createdAt)
+    INSERT INTO clips (name, emoji, color, tags, duration_ms, uploader_id, uploader_name, created_at)
+    VALUES (@name, @emoji, @color, @tags, @durationMs, @uploaderId, @uploaderName, @createdAt)
   `),
   listClips: db.prepare('SELECT * FROM clips ORDER BY created_at DESC'),
   getClip: db.prepare('SELECT * FROM clips WHERE id = ?'),
@@ -57,10 +63,11 @@ const stmts = {
   deleteClip: db.prepare('DELETE FROM clips WHERE id = ?'),
   bumpPlayCount: db.prepare('UPDATE clips SET play_count = play_count + 1 WHERE id = ?'),
   countClips: db.prepare('SELECT COUNT(*) AS n FROM clips'),
+  updateClipTags: db.prepare('UPDATE clips SET tags = ? WHERE id = ?'),
 };
 
 function insertClip(fields) {
-  const info = stmts.insertClip.run({ emoji: null, color: null, ...fields });
+  const info = stmts.insertClip.run({ emoji: null, color: null, tags: null, ...fields });
   return stmts.getClip.get(info.lastInsertRowid);
 }
 
@@ -83,6 +90,10 @@ function deleteClip(id) {
 
 function bumpPlayCount(id) {
   stmts.bumpPlayCount.run(id);
+}
+
+function updateClipTags(id, tagsJson) {
+  stmts.updateClipTags.run(tagsJson, id);
 }
 
 function countClips() {
@@ -123,6 +134,7 @@ module.exports = {
   findClipByName,
   deleteClip,
   bumpPlayCount,
+  updateClipTags,
   countClips,
   insertToken,
   getToken,

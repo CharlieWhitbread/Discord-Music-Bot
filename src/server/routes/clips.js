@@ -17,11 +17,24 @@ const { requireAuth, isAdmin } = require('../auth');
 const router = express.Router();
 
 const MAX_CLIPS = 200;
+const MAX_TAGS = 8;
 
 const upload = multer({
   dest: db.uploadsDir,
   limits: { fileSize: config.server.limits.maxUploadBytes, files: 1 },
 });
+
+/** Normalize a comma-separated tag string to a deduped, validated array. */
+function parseTags(raw) {
+  if (typeof raw !== 'string') return [];
+  const tags = [];
+  for (const part of raw.split(',')) {
+    const tag = part.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 24);
+    if (tag && /^[\p{L}\p{N} _-]+$/u.test(tag) && !tags.includes(tag)) tags.push(tag);
+    if (tags.length >= MAX_TAGS) break;
+  }
+  return tags;
+}
 
 function toClipJson(row) {
   return {
@@ -29,6 +42,7 @@ function toClipJson(row) {
     name: row.name,
     emoji: row.emoji,
     color: row.color,
+    tags: row.tags ? JSON.parse(row.tags) : [],
     durationMs: row.duration_ms,
     uploaderId: row.uploader_id,
     uploaderName: row.uploader_name,
@@ -81,6 +95,7 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
 
     const emoji = String(req.body.emoji ?? '').trim().slice(0, 8) || null;
     const color = /^#[0-9a-fA-F]{6}$/.test(req.body.color ?? '') ? req.body.color : null;
+    const tags = parseTags(req.body.tags);
 
     // Never trust the client: probe server-side before touching ffmpeg.
     let probed;
@@ -116,6 +131,7 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
       name,
       emoji,
       color,
+      tags: tags.length ? JSON.stringify(tags) : null,
       durationMs: Math.round((end - start) * 1000),
       uploaderId: req.user.userId,
       uploaderName: req.user.username,
@@ -143,6 +159,22 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
   } finally {
     cleanup();
   }
+});
+
+/* PATCH /api/clips/:id — update tags (uploader or admin) */
+router.patch('/:id', requireAuth, express.json(), (req, res) => {
+  const clip = db.getClip(Number(req.params.id));
+  if (!clip) {
+    res.status(404).json({ error: 'Clip not found' });
+    return;
+  }
+  if (clip.uploader_id !== req.user.userId && !isAdmin(req.user)) {
+    res.status(403).json({ error: 'Only the uploader or an admin can edit this clip' });
+    return;
+  }
+  const tags = parseTags(Array.isArray(req.body?.tags) ? req.body.tags.join(',') : req.body?.tags);
+  db.updateClipTags(clip.id, tags.length ? JSON.stringify(tags) : null);
+  res.json(toClipJson(db.getClip(clip.id)));
 });
 
 /* DELETE /api/clips/:id — uploader or admin only */
