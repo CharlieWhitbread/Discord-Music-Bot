@@ -34,21 +34,45 @@ export default function UploadModal({
   const [emoji, setEmoji] = useState('');
   const [range, setRange] = useState<{ start: number; end: number } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const waveRef = useRef<HTMLDivElement>(null);
   const surferRef = useRef<WaveSurfer | null>(null);
   const regionRef = useRef<Region | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const stopAtRef = useRef<(() => void) | null>(null);
+  const stopFnRef = useRef<(() => void) | null>(null);
 
   const stopPreview = () => {
-    const video = videoRef.current;
-    if (video && stopAtRef.current) {
-      video.removeEventListener('timeupdate', stopAtRef.current);
-      stopAtRef.current = null;
-    }
-    video?.pause();
+    stopFnRef.current?.();
+    stopFnRef.current = null;
+    setPreviewing(false);
+  };
+
+  /* Zoom the waveform so the selected region fills most of the view,
+     making fine scrubbing on long files practical. */
+  const zoomToRegion = (region: Region) => {
+    const surfer = surferRef.current;
+    const container = waveRef.current;
+    if (!surfer || !container) return;
+    const total = surfer.getDuration();
+    const len = region.end - region.start;
+    const pad = Math.max(len * 0.3, 0.5);
+    const viewLen = Math.min(total, len + pad * 2);
+    if (viewLen >= total * 0.95) return; // selection ~fills the file already
+    surfer.zoom(container.clientWidth / viewLen);
+    surfer.setScrollTime(Math.max(0, region.start - pad));
+    setZoomed(true);
+  };
+
+  const zoomOut = () => {
+    const surfer = surferRef.current;
+    const container = waveRef.current;
+    if (!surfer || !container) return;
+    surfer.zoom(container.clientWidth / surfer.getDuration());
+    surfer.setScrollTime(0);
+    setZoomed(false);
   };
 
   /* Build the waveform + trim region when a file is chosen. Video files are
@@ -94,10 +118,12 @@ export default function UploadModal({
         region.setOptions({ end: region.start + MAX_CLIP_SECONDS });
       }
       setRange({ start: region.start, end: region.end });
+      zoomToRegion(region);
     });
 
     return () => {
       stopPreview();
+      setZoomed(false);
       surfer.destroy();
       surferRef.current = null;
       regionRef.current = null;
@@ -108,7 +134,7 @@ export default function UploadModal({
     if (videoUrl) URL.revokeObjectURL(videoUrl);
   }, [videoUrl]);
 
-  const previewRegion = () => {
+  const playPreview = () => {
     const region = regionRef.current;
 
     // Videos preview through the media element — iOS mutes bare WebAudio
@@ -120,11 +146,18 @@ export default function UploadModal({
       stopPreview();
       video.currentTime = r.start;
       void video.play();
-      const stopAt = () => {
+      const onTime = () => {
         if (video.currentTime >= r.end) stopPreview();
       };
-      stopAtRef.current = stopAt;
-      video.addEventListener('timeupdate', stopAt);
+      const onEnded = () => stopPreview();
+      video.addEventListener('timeupdate', onTime);
+      video.addEventListener('ended', onEnded);
+      stopFnRef.current = () => {
+        video.removeEventListener('timeupdate', onTime);
+        video.removeEventListener('ended', onEnded);
+        video.pause();
+      };
+      setPreviewing(true);
       return;
     }
 
@@ -132,15 +165,21 @@ export default function UploadModal({
 
     const surfer = surferRef.current;
     if (!surfer) return;
+    stopPreview();
     surfer.setTime(region.start);
-    surfer.play();
-    const stopAt = () => {
-      if (surfer.getCurrentTime() >= region.end) {
-        surfer.pause();
-        surfer.un('timeupdate', stopAt);
-      }
+    void surfer.play();
+    const onTime = () => {
+      if (surfer.getCurrentTime() >= region.end) stopPreview();
     };
-    surfer.on('timeupdate', stopAt);
+    const onFinish = () => stopPreview();
+    surfer.on('timeupdate', onTime);
+    surfer.on('finish', onFinish);
+    stopFnRef.current = () => {
+      surfer.un('timeupdate', onTime);
+      surfer.un('finish', onFinish);
+      surfer.pause();
+    };
+    setPreviewing(true);
   };
 
   const pickFile = async (picked: File | null) => {
@@ -298,9 +337,17 @@ export default function UploadModal({
                 ? `Trim: ${range.start.toFixed(2)}s – ${range.end.toFixed(2)}s (${(range.end - range.start).toFixed(1)}s)`
                 : 'Loading…'}
             </span>
-            <button className="btn" onClick={previewRegion} disabled={!range}>
-              Preview
-            </button>
+            <div className="preview-btns">
+              {!fallback && zoomed && (
+                <button className="btn" onClick={zoomOut}>Full view</button>
+              )}
+              <button className="btn" onClick={playPreview} disabled={!range || previewing}>
+                ▶ Play
+              </button>
+              <button className="btn" onClick={stopPreview} disabled={!previewing}>
+                ■ Stop
+              </button>
+            </div>
           </div>
         )}
 

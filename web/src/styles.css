@@ -292,10 +292,13 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   font-size: 0.9rem;
   color: var(--muted);
 }
+
+.preview-btns { display: flex; gap: 8px; }
 
 .field-row { display: flex; gap: 8px; }
 .field-row input {
