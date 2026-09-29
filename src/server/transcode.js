@@ -12,8 +12,19 @@
  */
 
 const { spawn } = require('node:child_process');
-const ffmpegPath = require('ffmpeg-static');
-const ffprobePath = require('ffprobe-static').path;
+const fs = require('node:fs');
+
+/* Static binaries lack builds for some platforms (e.g. ffprobe-static on
+   Raspberry Pi/ARM), so fall back to env override, then the system PATH. */
+function resolveBin(envVar, staticPath, name) {
+  if (process.env[envVar]) return process.env[envVar];
+  if (staticPath && fs.existsSync(staticPath)) return staticPath;
+  console.warn(`[transcode] ${name} static binary missing — using system ${name}`);
+  return name;
+}
+
+const ffmpegPath = resolveBin('FFMPEG_PATH', require('ffmpeg-static'), 'ffmpeg');
+const ffprobePath = resolveBin('FFPROBE_PATH', require('ffprobe-static').path, 'ffprobe');
 
 // Bytes per second of s16le / 48 kHz / stereo.
 const PCM_BYTES_PER_SECOND = 48000 * 2 * 2;

@@ -86,7 +86,8 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
     let probed;
     try {
       probed = await transcode.probe(tmpFile);
-    } catch {
+    } catch (err) {
+      console.error('[clips] probe failed:', err.message);
       res.status(400).json({ error: 'File is not decodable audio' });
       return;
     }

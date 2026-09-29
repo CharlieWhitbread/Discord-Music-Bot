@@ -266,6 +266,8 @@ body {
 
 .waveform { background: var(--bg); border-radius: 10px; }
 
+.extract-note { color: var(--muted); margin: 0; font-size: 0.9rem; }
+
 .trim-row {
   display: flex;
   align-items: center;

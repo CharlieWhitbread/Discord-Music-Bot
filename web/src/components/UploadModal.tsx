@@ -2,9 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin, { type Region } from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import { api } from '../api';
+import { decodeAudio, makePeaks, renderWav } from '../audioExtract';
 
 const MAX_CLIP_SECONDS = 30;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
+// Videos never leave the phone (audio is extracted locally), so the cap only
+// guards browser memory during decode.
+const MAX_VIDEO_BYTES = 300 * 1024 * 1024;
+
+function isVideo(f: File): boolean {
+  return f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(f.name);
+}
 
 export default function UploadModal({
   onClose,
@@ -14,6 +22,8 @@ export default function UploadModal({
   onUploaded: () => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
+  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
+  const [extracting, setExtracting] = useState(false);
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState('');
   const [range, setRange] = useState<{ start: number; end: number } | null>(null);
@@ -23,10 +33,19 @@ export default function UploadModal({
   const waveRef = useRef<HTMLDivElement>(null);
   const surferRef = useRef<WaveSurfer | null>(null);
   const regionRef = useRef<Region | null>(null);
+  const previewCtxRef = useRef<AudioContext | null>(null);
+  const previewSrcRef = useRef<AudioBufferSourceNode | null>(null);
 
-  /* Build the waveform + trim region when a file is chosen. */
+  const stopPreview = () => {
+    previewSrcRef.current?.stop();
+    previewSrcRef.current = null;
+  };
+
+  /* Build the waveform + trim region when a file is chosen. Video files are
+     rendered from locally-decoded peaks; audio files decode from the blob URL. */
   useEffect(() => {
     if (!file || !waveRef.current) return;
+    if (isVideo(file) && !audioBuffer) return; // still extracting
 
     const regions = RegionsPlugin.create();
     const surfer = WaveSurfer.create({
@@ -35,12 +54,17 @@ export default function UploadModal({
       waveColor: '#5865f2',
       progressColor: '#8b93f8',
       cursorColor: '#ffffff',
-      url: URL.createObjectURL(file),
+      ...(audioBuffer
+        ? { peaks: [makePeaks(audioBuffer)], duration: audioBuffer.duration }
+        : { url: URL.createObjectURL(file) }),
       plugins: [regions],
     });
     surferRef.current = surfer;
 
-    surfer.on('decode', (duration) => {
+    let regionMade = false;
+    const makeRegion = (duration: number) => {
+      if (regionMade || duration <= 0) return;
+      regionMade = true;
       const region = regions.addRegion({
         start: 0,
         end: Math.min(duration, MAX_CLIP_SECONDS),
@@ -50,7 +74,9 @@ export default function UploadModal({
       });
       regionRef.current = region;
       setRange({ start: region.start, end: region.end });
-    });
+    };
+    surfer.on('decode', makeRegion);
+    surfer.on('ready', () => makeRegion(surfer.getDuration()));
 
     regions.on('region-updated', (region) => {
       // Clamp to the max clip length by nudging the end handle.
@@ -61,16 +87,34 @@ export default function UploadModal({
     });
 
     return () => {
+      stopPreview();
       surfer.destroy();
       surferRef.current = null;
       regionRef.current = null;
     };
-  }, [file]);
+  }, [file, audioBuffer]);
+
+  useEffect(() => () => { void previewCtxRef.current?.close(); }, []);
 
   const previewRegion = () => {
-    const surfer = surferRef.current;
     const region = regionRef.current;
-    if (!surfer || !region) return;
+    if (!region) return;
+
+    // Video path: the waveform has no backing media, so play the decoded
+    // buffer directly through WebAudio.
+    if (audioBuffer) {
+      stopPreview();
+      const ctx = (previewCtxRef.current ??= new AudioContext());
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuffer;
+      src.connect(ctx.destination);
+      src.start(0, region.start, region.end - region.start);
+      previewSrcRef.current = src;
+      return;
+    }
+
+    const surfer = surferRef.current;
+    if (!surfer) return;
     surfer.setTime(region.start);
     surfer.play();
     const stopAt = () => {
@@ -82,14 +126,38 @@ export default function UploadModal({
     surfer.on('timeupdate', stopAt);
   };
 
-  const pickFile = (picked: File | null) => {
+  const pickFile = async (picked: File | null) => {
     setError(null);
-    if (picked && picked.size > MAX_FILE_BYTES) {
-      setError('File is larger than 25 MB');
+    setAudioBuffer(null);
+    setRange(null);
+    if (!picked) {
+      setFile(null);
       return;
     }
-    setFile(picked);
-    if (picked && !name) setName(picked.name.replace(/\.[^.]+$/, '').slice(0, 64));
+
+    if (isVideo(picked)) {
+      if (picked.size > MAX_VIDEO_BYTES) {
+        setError('Video is larger than 300 MB — trim it in Photos first');
+        return;
+      }
+      setFile(picked);
+      setExtracting(true);
+      try {
+        setAudioBuffer(await decodeAudio(picked));
+      } catch {
+        setFile(null);
+        setError('Could not read audio from this video');
+      } finally {
+        setExtracting(false);
+      }
+    } else {
+      if (picked.size > MAX_FILE_BYTES) {
+        setError('File is larger than 25 MB');
+        return;
+      }
+      setFile(picked);
+    }
+    if (!name) setName(picked.name.replace(/\.[^.]+$/, '').slice(0, 64));
   };
 
   const submit = async () => {
@@ -101,11 +169,17 @@ export default function UploadModal({
     setError(null);
     try {
       const form = new FormData();
-      form.append('file', file);
+      if (audioBuffer) {
+        // Upload only the trimmed audio, not the whole video.
+        const wav = await renderWav(audioBuffer, range.start, range.end);
+        form.append('file', wav, `${name.trim()}.wav`);
+      } else {
+        form.append('file', file);
+        form.append('start', String(range.start));
+        form.append('end', String(range.end));
+      }
       form.append('name', name.trim());
       if (emoji.trim()) form.append('emoji', emoji.trim());
-      form.append('start', String(range.start));
-      form.append('end', String(range.end));
       await api.upload(form);
       onUploaded();
     } catch (err) {
@@ -122,11 +196,13 @@ export default function UploadModal({
 
         <input
           type="file"
-          accept="audio/*,video/mp4,video/webm"
-          onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+          accept="audio/*,video/*"
+          onChange={(e) => void pickFile(e.target.files?.[0] ?? null)}
         />
 
-        {file && (
+        {extracting && <p className="extract-note">Extracting audio from video…</p>}
+
+        {file && !extracting && (
           <>
             <div ref={waveRef} className="waveform" />
             <div className="trim-row">
