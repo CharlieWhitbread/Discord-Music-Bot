@@ -31,10 +31,17 @@ Discord-Music-Bot/
     ├── deploy-commands.js    # slash command registration script
     ├── commands/
     │   ├── join.js           # /join — connect + spawn librespot
-    │   └── leave.js          # /leave — teardown
-    └── audio/
-        └── sessionManager.js # librespot + ffmpeg + voice lifecycle
+    │   ├── leave.js          # /leave — teardown
+    │   ├── sound.js          # /sound — play a soundboard clip
+    │   └── stopsound.js      # /stopsound — stop the current clip
+    ├── audio/
+    │   ├── sessionManager.js # librespot + ffmpeg + voice lifecycle
+    │   └── mixer.js          # realtime frame clock; mutes Spotify under clips
+    └── server/               # Express API + WebSocket (soundboard backend)
 ```
+
+Plus `web/` — the React (Vite + TypeScript) soundboard frontend — and
+`scripts/make-test-clip.js` for generating a test clip.
 
 ## Prerequisites
 
@@ -89,8 +96,37 @@ Discord-Music-Bot/
 3. Open Spotify on any device, open the Connect device picker and select
    **DiscordBot** (or your configured name).
 4. Play music. Audio is streamed into the voice channel.
-5. Run `/leave` to disconnect and shut the receiver down.
+5. Run `/leave` to disconnect and shut the receiver down.5. Run `/sound <name>` to play a soundboard clip (Spotify is muted while it
+   plays), `/stopsound` to cut it off.
 
+## Soundboard
+
+A React web app (deployed to Azure Static Web Apps) lets friends upload,
+trim, and trigger short audio clips in the voice channel. The bot hosts an
+Express API + WebSocket on the Pi; clips are stored pre-transcoded as raw
+PCM so a button press plays near-instantly. Spotify audio is muted (still
+consumed, never paused) while a clip plays. See [PLAN.md](PLAN.md) for the
+full design.
+
+### Soundboard setup
+
+1. **Discord OAuth2** — in the
+   [Developer Portal](https://discord.com/developers/applications) →
+   OAuth2: copy the *Client Secret* into `DISCORD_CLIENT_SECRET`, and add a
+   redirect URI of `<PUBLIC_API_URL>/api/auth/callback`.
+2. **Expose the Pi** — via Cloudflare Tunnel (needs a domain) or Tailscale
+   Funnel (free `*.ts.net` hostname). The resulting HTTPS URL is
+   `PUBLIC_API_URL`. Never port-forward.
+3. **Azure Static Web App** (free tier) — create one, add the deployment
+   token as the `AZURE_STATIC_WEB_APPS_API_TOKEN` GitHub secret and set a
+   `VITE_API_BASE_URL` repository variable (= `PUBLIC_API_URL`). The
+   workflow in `.github/workflows/deploy-web.yml` deploys `web/` on push.
+   Set `WEB_ORIGIN` in `.env` to the SWA origin.
+4. **Local dev** — set `AUTH_DISABLED=true` in `.env` (LAN only!), create
+   `web/.env` with `VITE_API_BASE_URL=http://localhost:3000`, then
+   `cd web && npm install && npm run dev`.
+5. **Test clip** — `npm run test-clip` generates a 2 s chime named `test`;
+   verify with `/join` then `/sound test`.
 ## Error handling & resilience
 
 - **Child process failures** — `error`/`exit` events on both librespot and

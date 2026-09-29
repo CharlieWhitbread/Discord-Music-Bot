@@ -36,6 +36,33 @@ const config = {
     outputSampleRate: 48000, // Discord requires 48 kHz
     channels: 2,
   },
+
+  // Soundboard web server (Express + WebSocket, same process).
+  server: {
+    enabled: (process.env.SOUNDBOARD_ENABLED ?? 'true').toLowerCase() !== 'false',
+    port: Number.parseInt(process.env.SOUNDBOARD_PORT ?? '3000', 10) || 3000,
+    // Exact origin of the deployed web app, e.g. https://xyz.azurestaticapps.net
+    // (CORS is pinned to this; localhost dev origins are always allowed).
+    webOrigin: process.env.WEB_ORIGIN?.trim() || null,
+    // Public HTTPS URL of this API through the tunnel, used to build the
+    // OAuth redirect URI, e.g. https://api.example.com
+    publicApiUrl: process.env.PUBLIC_API_URL?.trim() || null,
+    // Discord OAuth2 client secret (Developer Portal → OAuth2).
+    clientSecret: process.env.DISCORD_CLIENT_SECRET?.trim() || null,
+    // Set to 'true' to skip auth entirely (LAN development only!).
+    authDisabled: (process.env.AUTH_DISABLED ?? 'false').toLowerCase() === 'true',
+    // Comma-separated Discord user ids allowed to delete any clip.
+    adminIds: (process.env.ADMIN_USER_IDS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    // Where clips + SQLite live.
+    dataDir: process.env.DATA_DIR?.trim() || null,
+    limits: {
+      maxUploadBytes: 25 * 1024 * 1024,
+      maxClipSeconds: 30,
+    },
+  },
 };
 
 module.exports = config;

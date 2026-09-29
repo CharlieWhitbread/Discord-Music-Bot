@@ -9,6 +9,7 @@ const { Client, Collection, GatewayIntentBits, Events, MessageFlags } = require(
 const { generateDependencyReport } = require('@discordjs/voice');
 const config = require('./config');
 const sessionManager = require('./audio/sessionManager');
+const soundboardServer = require('./server/server');
 
 // Shows which opus/encryption/DAVE libraries @discordjs/voice detected.
 console.log(generateDependencyReport());
@@ -38,6 +39,7 @@ for (const file of fs.readdirSync(commandsDir).filter((f) => f.endsWith('.js')))
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`[bot] logged in as ${readyClient.user.tag}`);
+  soundboardServer.start();
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -75,6 +77,7 @@ process.on('uncaughtException', (err) => {
 // Graceful shutdown: kill librespot/ffmpeg and leave voice cleanly.
 function shutdown(signal) {
   console.log(`[process] received ${signal}, shutting down`);
+  soundboardServer.stop();
   sessionManager.destroyAll();
   client.destroy();
   process.exit(0);

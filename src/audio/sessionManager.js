@@ -19,7 +19,7 @@
  */
 
 const { spawn } = require('node:child_process');
-const { PassThrough } = require('node:stream');
+const { EventEmitter } = require('node:events');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -33,14 +33,13 @@ const {
 } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
 const config = require('../config');
+const { Mixer } = require('./mixer');
 
 /** @type {Map<string, Session>} guildId → active session */
 const sessions = new Map();
 
-// 20 ms of s16le silence at 48 kHz stereo: 48000 * 2ch * 2B * 0.02
-const SILENCE_FRAME = Buffer.alloc(3840);
-// Inject silence if no real PCM arrived within this window (Spotify paused).
-const SILENCE_AFTER_MS = 200;
+/** Emits 'status' whenever session/clip state changes (WS broadcasts). */
+const events = new EventEmitter();
 
 /**
  * @typedef {object} Session
@@ -48,8 +47,7 @@ const SILENCE_AFTER_MS = 200;
  * @property {import('@discordjs/voice').AudioPlayer} player
  * @property {import('node:child_process').ChildProcess|null} librespot
  * @property {import('node:child_process').ChildProcess|null} ffmpeg
- * @property {import('node:stream').PassThrough|null} output
- * @property {NodeJS.Timeout|null} silenceTimer
+ * @property {import('./mixer').Mixer|null} mixer
  * @property {boolean} destroyed  Guard flag making destroySession idempotent.
  */
 
@@ -136,8 +134,7 @@ async function createSession(voiceChannel) {
     player: null,
     librespot: null,
     ffmpeg: null,
-    output: null,
-    silenceTimer: null,
+    mixer: null,
     destroyed: false,
   };
   sessions.set(guildId, session);
@@ -185,37 +182,28 @@ async function createSession(voiceChannel) {
       }
     });
 
-    /* 3 ─ Build player + resource from a persistent, silence-padded stream.
+    /* 3 ─ Build player + resource from the mixer.
      *
      * The resource must NOT read ffmpeg.stdout directly: when Spotify is
      * paused, librespot stops writing PCM, the player would go Idle and
      * @discordjs/voice would destroy the stream — breaking ffmpeg's pipe and
-     * killing the whole session. Instead, ffmpeg writes into a PassThrough
-     * we own, and a timer injects silence frames whenever real audio stops,
-     * so the player never goes idle across pauses and track gaps. */
-    session.output = new PassThrough({ highWaterMark: 1 << 16 });
-    session.output.on('error', (err) => {
-      console.error(`[output:${guildId}] stream error: ${err.message}`);
+     * killing the whole session. The mixer emits a frame every 20 ms no
+     * matter what (Spotify / soundboard clip / silence) and its capped input
+     * buffer provides the backpressure that paces librespot. */
+    session.mixer = new Mixer(guildId);
+    session.mixer.on('error', (err) => {
+      console.error(`[mixer:${guildId}] stream error: ${err.message}`);
+    });
+    session.mixer.on('clipstart', (clip) => {
+      console.log(`[mixer:${guildId}] clip started: ${clip.name}`);
+      emitStatus();
+    });
+    session.mixer.on('clipend', (clip) => {
+      console.log(`[mixer:${guildId}] clip ended: ${clip.name}`);
+      emitStatus();
     });
 
-    let lastDataAt = Date.now();
-    // Passive listener: only timestamps arrivals. The actual data transfer
-    // goes through pipe() so backpressure reaches librespot — the pipe
-    // backend has no clock and relies on the consumer for realtime pacing.
-    session.ffmpeg.stdout.on('data', () => {
-      lastDataAt = Date.now();
-    });
-    session.ffmpeg.stdout.pipe(session.output, { end: false });
-
-    session.silenceTimer = setInterval(() => {
-      if (
-        !session.destroyed &&
-        Date.now() - lastDataAt > SILENCE_AFTER_MS &&
-        session.output.readableLength === 0 // only when the player has drained real audio
-      ) {
-        session.output.write(SILENCE_FRAME);
-      }
-    }, 20);
+    session.ffmpeg.stdout.pipe(session.mixer.spotifyInput, { end: false });
 
     session.player = createAudioPlayer({
       behaviors: {
@@ -227,7 +215,7 @@ async function createSession(voiceChannel) {
 
     wirePlayerEvents(session, guildId);
 
-    const resource = createAudioResource(session.output, {
+    const resource = createAudioResource(session.mixer, {
       inputType: StreamType.Raw, // s16le / 48 kHz / stereo
       silencePaddingFrames: 5,
     });
@@ -236,6 +224,7 @@ async function createSession(voiceChannel) {
     session.connection.subscribe(session.player);
 
     console.log(`[session:${guildId}] ready — device "${config.librespot.deviceName}" is now visible in Spotify Connect`);
+    emitStatus();
     return { created: true };
   } catch (err) {
     // Any failure during setup must not leak processes or connections.
@@ -259,15 +248,13 @@ function destroySession(guildId) {
 
   console.log(`[session:${guildId}] tearing down`);
 
-  if (session.silenceTimer) clearInterval(session.silenceTimer);
-
   // Stop the player first so @discordjs/voice releases the stream.
   try {
     session.player?.stop(true);
   } catch { /* already stopped */ }
 
   try {
-    session.output?.destroy();
+    session.mixer?.destroy();
   } catch { /* stream already closed */ }
 
   // Unpipe before killing to avoid write-after-end errors.
@@ -285,6 +272,7 @@ function destroySession(guildId) {
     }
   } catch { /* connection already destroyed */ }
 
+  emitStatus();
   return true;
 }
 
@@ -298,6 +286,51 @@ function destroyAll() {
   for (const guildId of [...sessions.keys()]) {
     destroySession(guildId);
   }
+}
+
+/* ───────────────────────── soundboard API ─────────────────────────
+ * Single-guild by design: these operate on "the" active session. */
+
+/** @returns {Session|null} the first (only) live session. */
+function getActiveSession() {
+  for (const session of sessions.values()) {
+    if (!session.destroyed && session.mixer) return session;
+  }
+  return null;
+}
+
+/**
+ * Play a soundboard clip through the active session, muting Spotify
+ * underneath it. Replaces any clip already playing.
+ * @param {{id: string|number, name: string, buffer: Buffer}} clip raw s16le/48k/stereo PCM
+ * @returns {boolean} false when the bot is not in a voice channel.
+ */
+function playClip(clip) {
+  const session = getActiveSession();
+  if (!session) return false;
+  session.mixer.playClip(clip);
+  return true;
+}
+
+/** Stop the active clip. @returns {boolean} */
+function stopClip() {
+  const session = getActiveSession();
+  if (!session) return false;
+  return session.mixer.stopClip();
+}
+
+/** Status snapshot for /api/status and WS broadcasts. */
+function getStatus() {
+  const session = getActiveSession();
+  if (!session) {
+    return { inVoice: false, clip: null, spotifyActive: false };
+  }
+  const guildId = [...sessions.keys()].find((id) => sessions.get(id) === session) ?? null;
+  return { inVoice: true, guildId, ...session.mixer.getState() };
+}
+
+function emitStatus() {
+  events.emit('status', getStatus());
 }
 
 /* ───────────────────────── internal wiring ───────────────────────── */
@@ -434,4 +467,9 @@ module.exports = {
   destroySession,
   hasSession,
   destroyAll,
+  getActiveSession,
+  playClip,
+  stopClip,
+  getStatus,
+  events,
 };
