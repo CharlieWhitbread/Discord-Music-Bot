@@ -180,7 +180,8 @@ async function withDevice(fn) {
 /* ─────────────────────────── playback ─────────────────────────── */
 
 function search(q) {
-  return api('GET', '/search', { query: { q, type: 'track', limit: 12 } }).then((data) =>
+  // Spotify capped /search's limit at 10 (Feb 2026); higher values 400.
+  return api('GET', '/search', { query: { q, type: 'track', limit: 10 } }).then((data) =>
     (data?.tracks?.items ?? []).map((t) => ({
       uri: t.uri,
       name: t.name,
