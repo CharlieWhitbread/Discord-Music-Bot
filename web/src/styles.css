@@ -418,3 +418,152 @@ body {
   from { opacity: 0; transform: translate(-50%, 8px); }
   to { opacity: 1; transform: translate(-50%, 0); }
 }
+
+/* ── now-playing bar ── */
+.app.has-npbar { padding-bottom: 110px; }
+.app.has-npbar .toast { bottom: 96px; }
+
+.nowplaying-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(24, 25, 34, 0.96);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--border);
+  z-index: 40;
+}
+.np-progress {
+  height: 3px;
+  background: var(--panel-2);
+}
+.np-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 1s linear;
+}
+.np-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+}
+.np-art {
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.np-art-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-2);
+  font-size: 1.3rem;
+}
+.np-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+.np-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.np-title.muted { color: var(--muted); font-weight: 500; }
+.np-artist, .np-time {
+  color: var(--muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.np-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.np-btn {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 1.15rem;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+  line-height: 1;
+}
+.np-btn:hover:not(:disabled) { background: var(--panel-2); }
+.np-btn:disabled { opacity: 0.35; cursor: default; }
+.np-play { font-size: 1.35rem; }
+.np-search { margin-left: 6px; }
+
+@media (max-width: 560px) {
+  .np-time { display: none; }
+  .np-search { padding: 6px 10px; }
+}
+
+/* ── spotify search modal ── */
+.muted { color: var(--muted); }
+.modal.spotify-search { width: min(560px, 92vw); }
+.track-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.track-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.track-art {
+  width: 42px;
+  height: 42px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.track-art-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+}
+.track-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.track-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track-artist {
+  color: var(--muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track-actions { display: flex; gap: 6px; flex-shrink: 0; }
+@media (max-width: 560px) {
+  .track-actions { flex-direction: column; }
+  .track-actions .btn { padding: 5px 10px; font-size: 0.8rem; }
+}

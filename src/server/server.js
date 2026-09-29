@@ -14,6 +14,7 @@ const config = require('../config');
 const auth = require('./auth');
 const clipsRouter = require('./routes/clips');
 const { router: playRouter } = require('./routes/play');
+const spotifyRouter = require('./routes/spotify');
 const ws = require('./ws');
 
 /** @type {{httpServer: import('node:http').Server, wsHandle: {close: () => void}}|null} */
@@ -47,9 +48,11 @@ function buildApp() {
   /* ── rate limits (uploads are expensive; plays are spam-able) ── */
   const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20, standardHeaders: true });
   const playLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true });
+  const spotifyLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true });
 
   /* ── API ── */
   app.use('/api/clips', (req, res, next) => (req.method === 'POST' ? uploadLimiter(req, res, next) : next()), clipsRouter);
+  app.use('/api/spotify', spotifyLimiter, spotifyRouter);
   app.use('/api', (req, res, next) => (req.path.startsWith('/play') ? playLimiter(req, res, next) : next()), playRouter);
 
   app.get('/api/health', (_req, res) => res.json({ ok: true }));

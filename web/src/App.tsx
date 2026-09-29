@@ -3,13 +3,15 @@ import { api } from './api';
 import { ADMIN_USER } from './config';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
-import type { BotStatus, Clip, ConnectionState, User } from './types';
+import type { BotStatus, Clip, ConnectionState, SpotifyState, SpotifyStatus, User } from './types';
 import { formatTag } from './format';
 import Login from './components/Login';
 import StatusBanner from './components/StatusBanner';
 import SoundboardGrid from './components/SoundboardGrid';
 import UploadModal from './components/UploadModal';
 import EditClipModal from './components/EditClipModal';
+import NowPlayingBar from './components/NowPlayingBar';
+import SpotifySearchModal from './components/SpotifySearchModal';
 
 export default function App() {
   const [loginError] = useState<string | null>(() => captureTokenFromUrl());
@@ -23,6 +25,9 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [activeTags, setActiveTags] = useState<string[]>([]);
+  const [spotify, setSpotify] = useState<SpotifyState | null>(null);
+  const [spotifyStatus, setSpotifyStatus] = useState<SpotifyStatus | null>(null);
+  const [showSongSearch, setShowSongSearch] = useState(false);
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -42,10 +47,20 @@ export default function App() {
         setUser(me);
         refreshClips();
         api.status().then(setStatus).catch(() => {});
+        api.spotifyStatus().then(setSpotifyStatus).catch(() => {});
       })
       .catch(() => {})
       .finally(() => setAuthChecked(true));
   }, [refreshClips]);
+
+  /* Result of the admin's Spotify connect redirect (?spotify=connected|error) */
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const result = params.get('spotify');
+    if (!result) return;
+    window.history.replaceState(null, '', window.location.pathname);
+    notify(result === 'connected' ? 'Spotify connected!' : 'Spotify connection failed');
+  }, [notify]);
 
   /* Live status over WebSocket */
   useEffect(() => {
@@ -55,6 +70,7 @@ export default function App() {
       onStatus: setStatus,
       onState: setWsState,
       onError: notify,
+      onSpotify: setSpotify,
     });
     return () => {
       unsubscribe();
@@ -107,7 +123,7 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app${spotifyStatus?.configured ? ' has-npbar' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-logo">🎉</span>
@@ -190,6 +206,20 @@ export default function App() {
           onSaved={() => { setEditClip(null); refreshClips(); }}
         />
       )}
+
+      {showSongSearch && (
+        <SpotifySearchModal
+          onClose={() => setShowSongSearch(false)}
+          onNotify={notify}
+        />
+      )}
+
+      <NowPlayingBar
+        spotify={spotify}
+        status={spotifyStatus}
+        onSearch={() => setShowSongSearch(true)}
+        onError={notify}
+      />
 
       {toast && <div className="toast">{toast}</div>}
     </div>

@@ -1,6 +1,6 @@
 import { API_BASE } from './config';
 import { clearToken, getToken } from './auth';
-import type { BotStatus, Clip, User } from './types';
+import type { BotStatus, Clip, SpotifyStatus, SpotifyTrack, User } from './types';
 
 class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -46,6 +46,27 @@ export const api = {
   clipAudioUrl: (clipId: number) => `${API_BASE}/api/clips/${clipId}/audio`,
   upload: (form: FormData) =>
     request<Clip>('/api/clips', { method: 'POST', body: form }),
+
+  /* ── Spotify jukebox ── */
+  spotifyStatus: () => request<SpotifyStatus>('/api/spotify/status'),
+  // Browser navigation can't send headers, so the bearer token rides in the query.
+  spotifyLoginUrl: () => `${API_BASE}/api/spotify/login?token=${encodeURIComponent(getToken() ?? '')}`,
+  spotifySearch: (q: string) =>
+    request<SpotifyTrack[]>(`/api/spotify/search?q=${encodeURIComponent(q)}`),
+  spotifyPlay: (uri: string) =>
+    request<{ ok: true }>('/api/spotify/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uri }),
+    }),
+  spotifyQueue: (uri: string) =>
+    request<{ ok: true }>('/api/spotify/queue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uri }),
+    }),
+  spotifyControl: (action: 'pause' | 'resume' | 'next' | 'previous') =>
+    request<{ ok: true }>(`/api/spotify/${action}`, { method: 'POST' }),
 };
 
 export { ApiError };

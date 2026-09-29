@@ -16,10 +16,12 @@
 
 const { WebSocketServer } = require('ws');
 const sessionManager = require('../audio/sessionManager');
+const spotify = require('./spotify');
 const { resolveToken } = require('./auth');
 const { triggerClip } = require('./routes/play');
 
 const AUTH_TIMEOUT_MS = 10_000;
+const SPOTIFY_POLL_MS = 5_000;
 
 /**
  * @param {import('node:http').Server} httpServer
@@ -35,6 +37,24 @@ function attach(httpServer) {
     }
   };
   sessionManager.events.on('status', broadcast);
+
+  const broadcastSpotify = (spotifyState) => {
+    const frame = JSON.stringify({ type: 'spotify', spotify: spotifyState });
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN && client.isAuthed) client.send(frame);
+    }
+  };
+  spotify.events.on('nowplaying', broadcastSpotify);
+
+  // Poll Spotify only while someone is actually watching.
+  const hasAuthedClient = () => [...wss.clients].some((c) => c.isAuthed);
+  const spotifyPoll = setInterval(() => {
+    if (!spotify.connected() || !hasAuthedClient()) return;
+    spotify.fetchNowPlaying().catch((err) => {
+      console.error(`[spotify] poll failed: ${err.message}`);
+    });
+  }, SPOTIFY_POLL_MS);
+  spotifyPoll.unref();
 
   wss.on('connection', (socket) => {
     socket.isAuthed = false;
@@ -66,6 +86,8 @@ function attach(httpServer) {
         socket.user = user;
         socket.send(JSON.stringify({ type: 'auth', ok: true, user }));
         socket.send(JSON.stringify({ type: 'status', status: sessionManager.getStatus() }));
+        const np = spotify.getLastNowPlaying();
+        if (np) socket.send(JSON.stringify({ type: 'spotify', spotify: np }));
         return;
       }
 
@@ -105,7 +127,9 @@ function attach(httpServer) {
   return {
     close() {
       clearInterval(heartbeat);
+      clearInterval(spotifyPoll);
       sessionManager.events.off('status', broadcast);
+      spotify.events.off('nowplaying', broadcastSpotify);
       for (const client of wss.clients) client.terminate();
       wss.close();
     },

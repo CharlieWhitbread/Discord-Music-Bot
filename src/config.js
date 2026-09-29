@@ -7,6 +7,8 @@
  */
 require('dotenv').config();
 
+const path = require('node:path');
+
 function required(name) {
   const value = process.env[name];
   if (!value || value.trim() === '') {
@@ -28,6 +30,16 @@ const config = {
     path: process.env.LIBRESPOT_PATH?.trim() || '/usr/bin/librespot',
     deviceName: process.env.LIBRESPOT_DEVICE_NAME?.trim() || 'DiscordBot',
     initialVolume: Number.parseInt(process.env.LIBRESPOT_INITIAL_VOLUME ?? '100', 10) || 100,
+    // Cache dir holds credentials.json from the one-time OAuth login, so
+    // librespot signs straight into the owner's account (no casting needed).
+    cacheDir: process.env.LIBRESPOT_CACHE_DIR?.trim()
+      || path.join(process.env.DATA_DIR?.trim() || path.join(__dirname, '..', 'data'), 'librespot'),
+  },
+
+  // Spotify Web API app (developer.spotify.com) for the jukebox controls.
+  spotify: {
+    clientId: process.env.SPOTIFY_CLIENT_ID?.trim() || null,
+    clientSecret: process.env.SPOTIFY_CLIENT_SECRET?.trim() || null,
   },
 
   // Audio format emitted by librespot's pipe backend.

@@ -24,3 +24,27 @@ export interface BotStatus {
 }
 
 export type ConnectionState = 'connecting' | 'open' | 'closed';
+
+export interface SpotifyTrack {
+  uri: string;
+  name: string;
+  artists: string;
+  album: string;
+  image: string | null;
+  durationMs: number;
+}
+
+export interface SpotifyState {
+  active: boolean;
+  isPlaying?: boolean;
+  progressMs?: number;
+  fetchedAt?: number;
+  onOurDevice?: boolean;
+  track?: SpotifyTrack;
+}
+
+export interface SpotifyStatus {
+  configured: boolean;
+  connected: boolean;
+  canConnect: boolean;
+}

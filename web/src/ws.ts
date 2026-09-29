@@ -6,12 +6,13 @@
 
 import { WS_URL } from './config';
 import { getToken } from './auth';
-import type { BotStatus, ConnectionState } from './types';
+import type { BotStatus, ConnectionState, SpotifyState } from './types';
 
 type Listener = {
   onStatus?: (status: BotStatus) => void;
   onState?: (state: ConnectionState) => void;
   onError?: (error: string) => void;
+  onSpotify?: (spotify: SpotifyState) => void;
 };
 
 let socket: WebSocket | null = null;
@@ -41,6 +42,8 @@ export function connect(): void {
       setState('open');
     } else if (msg.type === 'status') {
       listeners.forEach((l) => l.onStatus?.(msg.status));
+    } else if (msg.type === 'spotify') {
+      listeners.forEach((l) => l.onSpotify?.(msg.spotify));
     } else if (msg.type === 'error') {
       listeners.forEach((l) => l.onError?.(msg.error));
     }

@@ -19,6 +19,7 @@
  */
 
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const { EventEmitter } = require('node:events');
 const {
   joinVoiceChannel,
@@ -58,12 +59,19 @@ const events = new EventEmitter();
  * writes raw PCM to stdout.
  */
 function spawnLibrespot() {
+  // The cache dir holds credentials.json from the one-time OAuth login
+  // (see README/PLAN): with it librespot signs into the account directly,
+  // no casting needed. Without it, zeroconf discovery still works.
+  fs.mkdirSync(config.librespot.cacheDir, { recursive: true });
+
   const args = [
     '--name', config.librespot.deviceName,
     '--backend', 'pipe',
     '--format', 'S16', // signed 16-bit little-endian
     '--initial-volume', String(config.librespot.initialVolume),
     '--bitrate', '320',
+    '--cache', config.librespot.cacheDir,
+    '--disable-audio-cache',
   ];
 
   console.log(`[librespot] spawning: ${config.librespot.path} ${args.join(' ')}`);
