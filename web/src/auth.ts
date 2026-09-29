@@ -25,6 +25,12 @@ export function getToken(): string | null {
   return localStorage.getItem(KEY);
 }
 
+/** Auth-disabled LAN dev: the server accepts any token, so store a stub
+ *  so the Authorization-header and WebSocket paths work unchanged. */
+export function setDevToken(): void {
+  localStorage.setItem(KEY, 'dev');
+}
+
 export function clearToken(): void {
   localStorage.removeItem(KEY);
 }

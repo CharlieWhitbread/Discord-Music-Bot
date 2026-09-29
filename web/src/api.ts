@@ -15,8 +15,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (res.status === 401) {
-    clearToken();
-    window.location.reload();
+    // Only force a re-login when a (now stale) token existed.
+    if (token) {
+      clearToken();
+      window.location.reload();
+    }
     throw new ApiError('Not authenticated', 401);
   }
   if (!res.ok) {

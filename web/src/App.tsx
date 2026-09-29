@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './api';
-import { captureTokenFromUrl, clearToken, getToken } from './auth';
+import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
 import type { BotStatus, Clip, ConnectionState, User } from './types';
 import Login from './components/Login';
@@ -27,14 +27,12 @@ export default function App() {
     api.clips().then(setClips).catch(() => notify('Failed to load clips'));
   }, [notify]);
 
-  /* Session bootstrap */
+  /* Session bootstrap. Probe /me even without a token — it succeeds when
+     the server runs with AUTH_DISABLED (LAN dev), skipping the login. */
   useEffect(() => {
-    if (!getToken()) {
-      setAuthChecked(true);
-      return;
-    }
     api.me()
       .then((me) => {
+        if (!getToken()) setDevToken();
         setUser(me);
         refreshClips();
         api.status().then(setStatus).catch(() => {});
