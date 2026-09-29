@@ -257,16 +257,36 @@ body {
   padding: 22px;
   width: 100%;
   max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 14px;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
 }
 .modal h2 { margin: 0; }
+.modal input[type='file'] { max-width: 100%; }
 
 .waveform { background: var(--bg); border-radius: 10px; }
 
 .extract-note { color: var(--muted); margin: 0; font-size: 0.9rem; }
+
+.fallback-video {
+  width: 100%;
+  max-height: 220px;
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.slider-rows { display: flex; flex-direction: column; gap: 6px; }
+.slider-rows label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.slider-rows input[type='range'] { flex: 1; min-width: 0; accent-color: var(--accent); }
 
 .trim-row {
   display: flex;
@@ -286,6 +306,7 @@ body {
   padding: 9px 12px;
   font-size: 0.95rem;
   flex: 1;
+  min-width: 0;
 }
 .field-row input:focus {
   outline: none;

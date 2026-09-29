@@ -9,6 +9,9 @@ const MAX_FILE_BYTES = 25 * 1024 * 1024;
 // Videos never leave the phone (audio is extracted locally), so the cap only
 // guards browser memory during decode.
 const MAX_VIDEO_BYTES = 300 * 1024 * 1024;
+// When the browser can't decode the container (iOS .mov), the whole video is
+// uploaded instead and the server extracts the audio. Must match the server cap.
+const MAX_FALLBACK_BYTES = 100 * 1024 * 1024;
 
 function isVideo(f: File): boolean {
   return f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(f.name);
@@ -24,6 +27,8 @@ export default function UploadModal({
   const [file, setFile] = useState<File | null>(null);
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [extracting, setExtracting] = useState(false);
+  const [fallbackUrl, setFallbackUrl] = useState<string | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState('');
   const [range, setRange] = useState<{ start: number; end: number } | null>(null);
@@ -33,6 +38,7 @@ export default function UploadModal({
   const waveRef = useRef<HTMLDivElement>(null);
   const surferRef = useRef<WaveSurfer | null>(null);
   const regionRef = useRef<Region | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const previewCtxRef = useRef<AudioContext | null>(null);
   const previewSrcRef = useRef<AudioBufferSourceNode | null>(null);
 
@@ -45,7 +51,7 @@ export default function UploadModal({
      rendered from locally-decoded peaks; audio files decode from the blob URL. */
   useEffect(() => {
     if (!file || !waveRef.current) return;
-    if (isVideo(file) && !audioBuffer) return; // still extracting
+    if (isVideo(file) && !audioBuffer) return; // extracting, or fallback mode
 
     const regions = RegionsPlugin.create();
     const surfer = WaveSurfer.create({
@@ -96,8 +102,29 @@ export default function UploadModal({
 
   useEffect(() => () => { void previewCtxRef.current?.close(); }, []);
 
+  useEffect(() => () => {
+    if (fallbackUrl) URL.revokeObjectURL(fallbackUrl);
+  }, [fallbackUrl]);
+
   const previewRegion = () => {
     const region = regionRef.current;
+
+    // Fallback path: preview by playing the video element itself.
+    if (fallbackUrl) {
+      const video = videoRef.current;
+      if (!video || !range) return;
+      video.currentTime = range.start;
+      void video.play();
+      const stopAt = () => {
+        if (video.currentTime >= range.end) {
+          video.pause();
+          video.removeEventListener('timeupdate', stopAt);
+        }
+      };
+      video.addEventListener('timeupdate', stopAt);
+      return;
+    }
+
     if (!region) return;
 
     // Video path: the waveform has no backing media, so play the decoded
@@ -129,6 +156,8 @@ export default function UploadModal({
   const pickFile = async (picked: File | null) => {
     setError(null);
     setAudioBuffer(null);
+    setFallbackUrl(null);
+    setVideoDuration(null);
     setRange(null);
     if (!picked) {
       setFile(null);
@@ -145,8 +174,14 @@ export default function UploadModal({
       try {
         setAudioBuffer(await decodeAudio(picked));
       } catch {
-        setFile(null);
-        setError('Could not read audio from this video');
+        // Container not decodable in this browser (e.g. iOS .mov) — upload
+        // the whole video and let the server's ffmpeg extract the audio.
+        if (picked.size > MAX_FALLBACK_BYTES) {
+          setFile(null);
+          setError('This browser can\u2019t read the video locally and it\u2019s over 100 MB — trim it in Photos first');
+        } else {
+          setFallbackUrl(URL.createObjectURL(picked));
+        }
       } finally {
         setExtracting(false);
       }
@@ -202,20 +237,76 @@ export default function UploadModal({
 
         {extracting && <p className="extract-note">Extracting audio from video…</p>}
 
-        {file && !extracting && (
+        {file && !extracting && fallbackUrl && (
           <>
-            <div ref={waveRef} className="waveform" />
-            <div className="trim-row">
-              <span>
-                {range
-                  ? `Trim: ${range.start.toFixed(2)}s – ${range.end.toFixed(2)}s (${(range.end - range.start).toFixed(1)}s)`
-                  : 'Loading waveform…'}
-              </span>
-              <button className="btn" onClick={previewRegion} disabled={!range}>
-                Preview
-              </button>
-            </div>
+            <video
+              ref={videoRef}
+              className="fallback-video"
+              src={fallbackUrl}
+              playsInline
+              onLoadedMetadata={(e) => {
+                const dur = e.currentTarget.duration;
+                if (Number.isFinite(dur)) {
+                  setVideoDuration(dur);
+                  setRange({ start: 0, end: Math.min(dur, MAX_CLIP_SECONDS) });
+                }
+              }}
+            />
+            {range && videoDuration != null && (
+              <div className="slider-rows">
+                <label>
+                  Start
+                  <input
+                    type="range"
+                    min={0}
+                    max={videoDuration}
+                    step={0.1}
+                    value={range.start}
+                    onChange={(e) => {
+                      const start = Number(e.target.value);
+                      const end = Math.min(
+                        videoDuration,
+                        Math.max(range.end, start + 0.2, Math.min(range.end, start + MAX_CLIP_SECONDS)),
+                      );
+                      setRange({ start, end: Math.min(end, start + MAX_CLIP_SECONDS) });
+                    }}
+                  />
+                </label>
+                <label>
+                  End
+                  <input
+                    type="range"
+                    min={0}
+                    max={videoDuration}
+                    step={0.1}
+                    value={range.end}
+                    onChange={(e) => {
+                      const end = Number(e.target.value);
+                      const start = Math.max(0, Math.min(range.start, end - 0.2));
+                      setRange({ start: Math.max(start, end - MAX_CLIP_SECONDS), end });
+                    }}
+                  />
+                </label>
+              </div>
+            )}
           </>
+        )}
+
+        {file && !extracting && !fallbackUrl && (
+          <div ref={waveRef} className="waveform" />
+        )}
+
+        {file && !extracting && (
+          <div className="trim-row">
+            <span>
+              {range
+                ? `Trim: ${range.start.toFixed(2)}s – ${range.end.toFixed(2)}s (${(range.end - range.start).toFixed(1)}s)`
+                : 'Loading…'}
+            </span>
+            <button className="btn" onClick={previewRegion} disabled={!range}>
+              Preview
+            </button>
+          </div>
         )}
 
         <div className="field-row">

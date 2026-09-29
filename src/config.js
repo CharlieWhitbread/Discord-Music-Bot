@@ -59,7 +59,9 @@ const config = {
     // Where clips + SQLite live.
     dataDir: process.env.DATA_DIR?.trim() || null,
     limits: {
-      maxUploadBytes: 25 * 1024 * 1024,
+      // Large enough for whole-video uploads when the browser can't extract
+      // audio locally (e.g. iOS .mov); ffmpeg discards the video stream.
+      maxUploadBytes: 100 * 1024 * 1024,
       maxClipSeconds: 30,
     },
   },
