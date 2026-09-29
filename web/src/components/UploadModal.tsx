@@ -27,7 +27,8 @@ export default function UploadModal({
   const [file, setFile] = useState<File | null>(null);
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [extracting, setExtracting] = useState(false);
-  const [fallbackUrl, setFallbackUrl] = useState<string | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [fallback, setFallback] = useState(false);
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState('');
@@ -39,12 +40,15 @@ export default function UploadModal({
   const surferRef = useRef<WaveSurfer | null>(null);
   const regionRef = useRef<Region | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const previewCtxRef = useRef<AudioContext | null>(null);
-  const previewSrcRef = useRef<AudioBufferSourceNode | null>(null);
+  const stopAtRef = useRef<(() => void) | null>(null);
 
   const stopPreview = () => {
-    previewSrcRef.current?.stop();
-    previewSrcRef.current = null;
+    const video = videoRef.current;
+    if (video && stopAtRef.current) {
+      video.removeEventListener('timeupdate', stopAtRef.current);
+      stopAtRef.current = null;
+    }
+    video?.pause();
   };
 
   /* Build the waveform + trim region when a file is chosen. Video files are
@@ -100,45 +104,31 @@ export default function UploadModal({
     };
   }, [file, audioBuffer]);
 
-  useEffect(() => () => { void previewCtxRef.current?.close(); }, []);
-
   useEffect(() => () => {
-    if (fallbackUrl) URL.revokeObjectURL(fallbackUrl);
-  }, [fallbackUrl]);
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+  }, [videoUrl]);
 
   const previewRegion = () => {
     const region = regionRef.current;
 
-    // Fallback path: preview by playing the video element itself.
-    if (fallbackUrl) {
+    // Videos preview through the media element — iOS mutes bare WebAudio
+    // output when the silent switch is on, but media elements still play.
+    if (videoUrl) {
       const video = videoRef.current;
-      if (!video || !range) return;
-      video.currentTime = range.start;
+      const r = fallback ? range : region && { start: region.start, end: region.end };
+      if (!video || !r) return;
+      stopPreview();
+      video.currentTime = r.start;
       void video.play();
       const stopAt = () => {
-        if (video.currentTime >= range.end) {
-          video.pause();
-          video.removeEventListener('timeupdate', stopAt);
-        }
+        if (video.currentTime >= r.end) stopPreview();
       };
+      stopAtRef.current = stopAt;
       video.addEventListener('timeupdate', stopAt);
       return;
     }
 
     if (!region) return;
-
-    // Video path: the waveform has no backing media, so play the decoded
-    // buffer directly through WebAudio.
-    if (audioBuffer) {
-      stopPreview();
-      const ctx = (previewCtxRef.current ??= new AudioContext());
-      const src = ctx.createBufferSource();
-      src.buffer = audioBuffer;
-      src.connect(ctx.destination);
-      src.start(0, region.start, region.end - region.start);
-      previewSrcRef.current = src;
-      return;
-    }
 
     const surfer = surferRef.current;
     if (!surfer) return;
@@ -156,7 +146,8 @@ export default function UploadModal({
   const pickFile = async (picked: File | null) => {
     setError(null);
     setAudioBuffer(null);
-    setFallbackUrl(null);
+    setVideoUrl(null);
+    setFallback(false);
     setVideoDuration(null);
     setRange(null);
     if (!picked) {
@@ -173,6 +164,7 @@ export default function UploadModal({
       setExtracting(true);
       try {
         setAudioBuffer(await decodeAudio(picked));
+        setVideoUrl(URL.createObjectURL(picked));
       } catch {
         // Container not decodable in this browser (e.g. iOS .mov) — upload
         // the whole video and let the server's ffmpeg extract the audio.
@@ -180,7 +172,8 @@ export default function UploadModal({
           setFile(null);
           setError('This browser can\u2019t read the video locally and it\u2019s over 100 MB — trim it in Photos first');
         } else {
-          setFallbackUrl(URL.createObjectURL(picked));
+          setVideoUrl(URL.createObjectURL(picked));
+          setFallback(true);
         }
       } finally {
         setExtracting(false);
@@ -237,23 +230,27 @@ export default function UploadModal({
 
         {extracting && <p className="extract-note">Extracting audio from video…</p>}
 
-        {file && !extracting && fallbackUrl && (
-          <>
-            <video
-              ref={videoRef}
-              className="fallback-video"
-              src={fallbackUrl}
-              playsInline
-              onLoadedMetadata={(e) => {
-                const dur = e.currentTarget.duration;
-                if (Number.isFinite(dur)) {
-                  setVideoDuration(dur);
-                  setRange({ start: 0, end: Math.min(dur, MAX_CLIP_SECONDS) });
-                }
-              }}
-            />
-            {range && videoDuration != null && (
-              <div className="slider-rows">
+        {videoUrl && (
+          <video
+            ref={videoRef}
+            className="fallback-video"
+            src={videoUrl}
+            playsInline
+            preload="auto"
+            style={fallback ? undefined : { display: 'none' }}
+            onLoadedMetadata={(e) => {
+              if (!fallback) return;
+              const dur = e.currentTarget.duration;
+              if (Number.isFinite(dur)) {
+                setVideoDuration(dur);
+                setRange({ start: 0, end: Math.min(dur, MAX_CLIP_SECONDS) });
+              }
+            }}
+          />
+        )}
+
+        {file && !extracting && fallback && range && videoDuration != null && (
+          <div className="slider-rows">
                 <label>
                   Start
                   <input
@@ -287,12 +284,10 @@ export default function UploadModal({
                     }}
                   />
                 </label>
-              </div>
-            )}
-          </>
+          </div>
         )}
 
-        {file && !extracting && !fallbackUrl && (
+        {file && !extracting && !fallback && (
           <div ref={waveRef} className="waveform" />
         )}
 
