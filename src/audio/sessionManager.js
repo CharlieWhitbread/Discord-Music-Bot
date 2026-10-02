@@ -39,6 +39,9 @@ const { Mixer } = require('./mixer');
 /** @type {Map<string, Session>} guildId → active session */
 const sessions = new Map();
 
+/** Music volume (0-100). Module-level so it survives session teardown. */
+let musicVolume = 100;
+
 /** Emits 'status' whenever session/clip state changes (WS broadcasts). */
 const events = new EventEmitter();
 
@@ -199,6 +202,7 @@ async function createSession(voiceChannel) {
      * matter what (Spotify / soundboard clip / silence) and its capped input
      * buffer provides the backpressure that paces librespot. */
     session.mixer = new Mixer(guildId);
+    session.mixer.setMusicVolume(musicVolume / 100);
     session.mixer.on('error', (err) => {
       console.error(`[mixer:${guildId}] stream error: ${err.message}`);
     });
@@ -327,14 +331,32 @@ function stopClip() {
   return session.mixer.stopClip();
 }
 
+/** Set the music-only volume (0-100); clips are unaffected. */
+function setMusicVolume(value) {
+  const v = Math.min(100, Math.max(0, Math.round(Number(value))));
+  if (!Number.isFinite(v)) return musicVolume;
+  musicVolume = v;
+  getActiveSession()?.mixer.setMusicVolume(v / 100);
+  emitStatus();
+  return musicVolume;
+}
+
+/** Instantly mute/unmute music while the real Spotify pause propagates. */
+function setSpotifyMuted(muted) {
+  const session = getActiveSession();
+  if (!session) return false;
+  session.mixer.setMusicMuted(muted);
+  return true;
+}
+
 /** Status snapshot for /api/status and WS broadcasts. */
 function getStatus() {
   const session = getActiveSession();
   if (!session) {
-    return { inVoice: false, clip: null, spotifyActive: false };
+    return { inVoice: false, clip: null, spotifyActive: false, musicVolume };
   }
   const guildId = [...sessions.keys()].find((id) => sessions.get(id) === session) ?? null;
-  return { inVoice: true, guildId, ...session.mixer.getState() };
+  return { inVoice: true, guildId, musicVolume, ...session.mixer.getState() };
 }
 
 function emitStatus() {
@@ -478,6 +500,8 @@ module.exports = {
   getActiveSession,
   playClip,
   stopClip,
+  setMusicVolume,
+  setSpotifyMuted,
   getStatus,
   events,
 };

@@ -21,6 +21,8 @@ export interface BotStatus {
   inVoice: boolean;
   clip: { id: number; name: string } | null;
   spotifyActive: boolean;
+  musicVolume?: number;
+  musicMuted?: boolean;
 }
 
 export type ConnectionState = 'connecting' | 'open' | 'closed';
@@ -47,4 +49,11 @@ export interface SpotifyStatus {
   configured: boolean;
   connected: boolean;
   canConnect: boolean;
+}
+
+export interface QueueEntry {
+  id: number;
+  track: SpotifyTrack;
+  addedBy: { userId: string; username: string };
+  addedAt: number;
 }

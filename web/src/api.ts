@@ -1,6 +1,6 @@
 import { API_BASE } from './config';
 import { clearToken, getToken } from './auth';
-import type { BotStatus, Clip, SpotifyStatus, SpotifyTrack, User } from './types';
+import type { BotStatus, Clip, QueueEntry, SpotifyStatus, SpotifyTrack, User } from './types';
 
 class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -60,10 +60,19 @@ export const api = {
       body: JSON.stringify({ uri }),
     }),
   spotifyQueue: (uri: string) =>
-    request<{ ok: true }>('/api/spotify/queue', {
+    request<QueueEntry>('/api/spotify/queue', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ uri }),
+    }),
+  spotifyQueueList: () => request<QueueEntry[]>('/api/spotify/queue'),
+  spotifyQueueRemove: (id: number) =>
+    request<{ ok: true }>(`/api/spotify/queue/${id}`, { method: 'DELETE' }),
+  spotifyVolume: (value: number) =>
+    request<{ ok: true; value: number }>('/api/spotify/volume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
     }),
   spotifyControl: (action: 'pause' | 'resume' | 'next' | 'previous') =>
     request<{ ok: true }>(`/api/spotify/${action}`, { method: 'POST' }),

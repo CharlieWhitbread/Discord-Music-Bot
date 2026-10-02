@@ -49,7 +49,7 @@ export default function SpotifySearchModal({ onClose, onNotify }: Props) {
     const call = mode === 'play' ? api.spotifyPlay(track.uri) : api.spotifyQueue(track.uri);
     call
       .then(() => {
-        if (mode === 'queue') onNotify(`Queued: ${track.name}`);
+        if (mode === 'queue') onNotify(`Added to queue: ${track.name}`);
         else onClose();
       })
       .catch((err) => onNotify(err.message))

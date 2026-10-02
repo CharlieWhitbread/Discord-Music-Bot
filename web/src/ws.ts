@@ -6,13 +6,14 @@
 
 import { WS_URL } from './config';
 import { getToken } from './auth';
-import type { BotStatus, ConnectionState, SpotifyState } from './types';
+import type { BotStatus, ConnectionState, QueueEntry, SpotifyState } from './types';
 
 type Listener = {
   onStatus?: (status: BotStatus) => void;
   onState?: (state: ConnectionState) => void;
   onError?: (error: string) => void;
   onSpotify?: (spotify: SpotifyState) => void;
+  onQueue?: (queue: QueueEntry[]) => void;
 };
 
 let socket: WebSocket | null = null;
@@ -44,6 +45,8 @@ export function connect(): void {
       listeners.forEach((l) => l.onStatus?.(msg.status));
     } else if (msg.type === 'spotify') {
       listeners.forEach((l) => l.onSpotify?.(msg.spotify));
+    } else if (msg.type === 'queue') {
+      listeners.forEach((l) => l.onQueue?.(msg.queue));
     } else if (msg.type === 'error') {
       listeners.forEach((l) => l.onError?.(msg.error));
     }
@@ -87,6 +90,23 @@ export function sendPlay(clipId: number): boolean {
 export function sendStop(): boolean {
   if (socket?.readyState === WebSocket.OPEN && state === 'open') {
     socket.send(JSON.stringify({ type: 'stop' }));
+    return true;
+  }
+  return false;
+}
+
+/** Pause/resume over the hot socket for instant-feel transport. */
+export function sendSpotifyTransport(action: 'pause' | 'resume'): boolean {
+  if (socket?.readyState === WebSocket.OPEN && state === 'open') {
+    socket.send(JSON.stringify({ type: `spotify:${action}` }));
+    return true;
+  }
+  return false;
+}
+
+export function sendVolume(value: number): boolean {
+  if (socket?.readyState === WebSocket.OPEN && state === 'open') {
+    socket.send(JSON.stringify({ type: 'volume', value }));
     return true;
   }
   return false;

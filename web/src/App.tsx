@@ -3,7 +3,7 @@ import { api } from './api';
 import { ADMIN_USER } from './config';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
-import type { BotStatus, Clip, ConnectionState, SpotifyState, SpotifyStatus, User } from './types';
+import type { BotStatus, Clip, ConnectionState, QueueEntry, SpotifyState, SpotifyStatus, User } from './types';
 import { formatTag } from './format';
 import Login from './components/Login';
 import StatusBanner from './components/StatusBanner';
@@ -12,6 +12,7 @@ import UploadModal from './components/UploadModal';
 import EditClipModal from './components/EditClipModal';
 import NowPlayingBar from './components/NowPlayingBar';
 import SpotifySearchModal from './components/SpotifySearchModal';
+import QueuePanel from './components/QueuePanel';
 
 export default function App() {
   const [loginError] = useState<string | null>(() => captureTokenFromUrl());
@@ -28,6 +29,8 @@ export default function App() {
   const [spotify, setSpotify] = useState<SpotifyState | null>(null);
   const [spotifyStatus, setSpotifyStatus] = useState<SpotifyStatus | null>(null);
   const [showSongSearch, setShowSongSearch] = useState(false);
+  const [queue, setQueue] = useState<QueueEntry[]>([]);
+  const [showQueue, setShowQueue] = useState(false);
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -48,6 +51,7 @@ export default function App() {
         refreshClips();
         api.status().then(setStatus).catch(() => {});
         api.spotifyStatus().then(setSpotifyStatus).catch(() => {});
+        api.spotifyQueueList().then(setQueue).catch(() => {});
       })
       .catch(() => {})
       .finally(() => setAuthChecked(true));
@@ -71,6 +75,7 @@ export default function App() {
       onState: setWsState,
       onError: notify,
       onSpotify: setSpotify,
+      onQueue: setQueue,
     });
     return () => {
       unsubscribe();
@@ -214,10 +219,22 @@ export default function App() {
         />
       )}
 
+      {showQueue && (
+        <QueuePanel
+          queue={queue}
+          onClose={() => setShowQueue(false)}
+          onAddSongs={() => { setShowQueue(false); setShowSongSearch(true); }}
+          onNotify={notify}
+        />
+      )}
+
       <NowPlayingBar
         spotify={spotify}
         status={spotifyStatus}
+        musicVolume={status?.musicVolume ?? 100}
+        queueCount={queue.length}
         onSearch={() => setShowSongSearch(true)}
+        onQueue={() => setShowQueue(true)}
         onError={notify}
       />
 

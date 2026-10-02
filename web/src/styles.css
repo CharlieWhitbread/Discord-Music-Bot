@@ -505,10 +505,33 @@ body {
 .np-btn:disabled { opacity: 0.35; cursor: default; }
 .np-play { font-size: 1.35rem; }
 .np-search { margin-left: 6px; }
+.np-volume {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  color: var(--muted);
+}
+.np-volume input[type='range'] {
+  width: 90px;
+  accent-color: var(--accent, #1db954);
+  cursor: pointer;
+}
+.queue-pos {
+  width: 18px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 
 @media (max-width: 560px) {
   .np-time { display: none; }
   .np-search { padding: 6px 10px; }
+  .np-volume input[type='range'] { width: 64px; }
+  .np-inner { flex-wrap: wrap; }
+  /* the bar can wrap to two rows on phones — leave room for it */
+  .app.has-npbar { padding-bottom: 170px; }
+  .app.has-npbar .toast { bottom: 150px; }
 }
 
 /* ── spotify search modal ── */

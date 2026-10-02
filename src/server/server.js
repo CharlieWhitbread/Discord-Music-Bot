@@ -14,7 +14,7 @@ const config = require('../config');
 const auth = require('./auth');
 const clipsRouter = require('./routes/clips');
 const { router: playRouter } = require('./routes/play');
-const spotifyRouter = require('./routes/spotify');
+const { router: spotifyRouter } = require('./routes/spotify');
 const ws = require('./ws');
 
 /** @type {{httpServer: import('node:http').Server, wsHandle: {close: () => void}}|null} */

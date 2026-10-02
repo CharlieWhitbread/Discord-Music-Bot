@@ -179,17 +179,26 @@ async function withDevice(fn) {
 
 /* ─────────────────────────── playback ─────────────────────────── */
 
+function mapTrack(t) {
+  return {
+    uri: t.uri,
+    name: t.name,
+    artists: (t.artists ?? []).map((a) => a.name).join(', '),
+    album: t.album?.name ?? '',
+    image: t.album?.images?.at(-1)?.url ?? null,
+    durationMs: t.duration_ms,
+  };
+}
+
 function search(q) {
   // Spotify capped /search's limit at 10 (Feb 2026); higher values 400.
   return api('GET', '/search', { query: { q, type: 'track', limit: 10 } }).then((data) =>
-    (data?.tracks?.items ?? []).map((t) => ({
-      uri: t.uri,
-      name: t.name,
-      artists: t.artists.map((a) => a.name).join(', '),
-      album: t.album?.name ?? '',
-      image: t.album?.images?.at(-1)?.url ?? null,
-      durationMs: t.duration_ms,
-    })));
+    (data?.tracks?.items ?? []).map(mapTrack));
+}
+
+/** Authoritative track metadata by id (used when queueing). */
+function getTrack(id) {
+  return api('GET', `/tracks/${id}`).then(mapTrack);
 }
 
 const playUri = (uri) => withDevice((id) => api('PUT', '/me/player/play', { query: { device_id: id }, body: { uris: [uri] } }));
@@ -246,6 +255,7 @@ module.exports = {
   loginUrl,
   handleCallback,
   search,
+  getTrack,
   playUri,
   queueUri,
   pause,

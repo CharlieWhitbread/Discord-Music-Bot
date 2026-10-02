@@ -9,16 +9,22 @@
  *   client → server: {type:'auth', token}   must be the first message
  *                    {type:'play', clipId}
  *                    {type:'stop'}
+ *                    {type:'spotify:pause'} / {type:'spotify:resume'}
+ *                    {type:'volume', value}   music-only, 0–100
  *   server → client: {type:'auth', ok, user?}
  *                    {type:'status', status}   pushed on every state change
+ *                    {type:'spotify', spotify} now-playing updates
+ *                    {type:'queue', queue}     bot queue updates
  *                    {type:'error', error, clipId?}
  */
 
 const { WebSocketServer } = require('ws');
 const sessionManager = require('../audio/sessionManager');
 const spotify = require('./spotify');
+const queue = require('./queue');
 const { resolveToken } = require('./auth');
 const { triggerClip } = require('./routes/play');
+const { pausePlayback, resumePlayback } = require('./routes/spotify');
 
 const AUTH_TIMEOUT_MS = 10_000;
 const SPOTIFY_POLL_MS = 5_000;
@@ -45,6 +51,14 @@ function attach(httpServer) {
     }
   };
   spotify.events.on('nowplaying', broadcastSpotify);
+
+  const broadcastQueue = (items) => {
+    const frame = JSON.stringify({ type: 'queue', queue: items });
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN && client.isAuthed) client.send(frame);
+    }
+  };
+  queue.events.on('update', broadcastQueue);
 
   // Poll Spotify only while someone is actually watching.
   const hasAuthedClient = () => [...wss.clients].some((c) => c.isAuthed);
@@ -88,6 +102,7 @@ function attach(httpServer) {
         socket.send(JSON.stringify({ type: 'status', status: sessionManager.getStatus() }));
         const np = spotify.getLastNowPlaying();
         if (np) socket.send(JSON.stringify({ type: 'spotify', spotify: np }));
+        socket.send(JSON.stringify({ type: 'queue', queue: queue.list() }));
         return;
       }
 
@@ -103,6 +118,22 @@ function attach(httpServer) {
 
       if (msg.type === 'stop') {
         sessionManager.stopClip();
+        return;
+      }
+
+      if (msg.type === 'spotify:pause' || msg.type === 'spotify:resume') {
+        const run = msg.type === 'spotify:pause' ? pausePlayback : resumePlayback;
+        run().catch((err) => {
+          console.error(`[spotify] ${msg.type} failed: ${err.message}`);
+          if (socket.readyState === socket.OPEN) {
+            socket.send(JSON.stringify({ type: 'error', error: 'Spotify request failed' }));
+          }
+        });
+        return;
+      }
+
+      if (msg.type === 'volume' && Number.isFinite(Number(msg.value))) {
+        sessionManager.setMusicVolume(Number(msg.value));
       }
     });
 
@@ -130,6 +161,7 @@ function attach(httpServer) {
       clearInterval(spotifyPoll);
       sessionManager.events.off('status', broadcast);
       spotify.events.off('nowplaying', broadcastSpotify);
+      queue.events.off('update', broadcastQueue);
       for (const client of wss.clients) client.terminate();
       wss.close();
     },

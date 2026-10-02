@@ -12,10 +12,51 @@ const express = require('express');
 const config = require('../../config');
 const { requireAuth, resolveToken, isAdmin } = require('../auth');
 const spotify = require('../spotify');
+const queue = require('../queue');
+const sessionManager = require('../../audio/sessionManager');
 
 const router = express.Router();
 
 const TRACK_URI = /^spotify:track:[A-Za-z0-9]{22}$/;
+
+/**
+ * Instant-feel pause: mute the mixer locally right away, then send the
+ * real pause. If the API call fails, unmute so audio isn't silently lost.
+ * Shared by the HTTP route and the WebSocket handler.
+ */
+let mutedAt = 0;
+async function pausePlayback() {
+  sessionManager.setSpotifyMuted(true);
+  mutedAt = Date.now();
+  try {
+    await spotify.pause();
+  } catch (err) {
+    sessionManager.setSpotifyMuted(false);
+    throw err;
+  }
+}
+
+// If playback is resumed from the Spotify app directly, unmute the mixer
+// so we don't sit on silently-consumed PCM. The 5 s grace period stops a
+// stale "playing" poll from undoing a just-issued instant pause.
+spotify.events.on('nowplaying', (np) => {
+  if (np?.isPlaying && Date.now() - mutedAt > 5000) {
+    sessionManager.setSpotifyMuted(false);
+  }
+});
+
+/** Counterpart of pausePlayback: unmute immediately, then resume. */
+async function resumePlayback() {
+  sessionManager.setSpotifyMuted(false);
+  await spotify.resume();
+}
+
+/** Queue-aware skip: prefer the bot queue over Spotify autoplay. */
+async function skipPlayback() {
+  sessionManager.setSpotifyMuted(false);
+  if (queue.hasItems()) await queue.playNext();
+  else await spotify.next();
+}
 
 function sendError(res, err) {
   const status = err.status === 409 ? 409 : err.status === 403 ? 403 : 502;
@@ -92,11 +133,19 @@ router.post('/play', requireAuth, requireConnected, async (req, res) => {
     return;
   }
   try {
+    // "Play now" doesn't wipe the queue — it resumes after this track.
+    sessionManager.setSpotifyMuted(false);
     await spotify.playUri(uri);
     res.json({ ok: true });
   } catch (err) {
     sendError(res, err);
   }
+});
+
+/* ── bot-owned queue (view/add/remove for any member) ── */
+
+router.get('/queue', requireAuth, (_req, res) => {
+  res.json(queue.list());
 });
 
 router.post('/queue', requireAuth, requireConnected, async (req, res) => {
@@ -106,17 +155,33 @@ router.post('/queue', requireAuth, requireConnected, async (req, res) => {
     return;
   }
   try {
-    await spotify.queueUri(uri);
-    res.json({ ok: true });
+    res.status(201).json(await queue.add(uri, req.user));
   } catch (err) {
     sendError(res, err);
   }
 });
 
-for (const action of ['pause', 'resume', 'next', 'previous']) {
+router.delete('/queue/:id', requireAuth, (req, res) => {
+  const removed = queue.remove(Number(req.params.id));
+  if (!removed) {
+    res.status(404).json({ error: 'Not in queue' });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+/* ── transport controls ── */
+
+const controls = {
+  pause: pausePlayback,
+  resume: resumePlayback,
+  next: skipPlayback,
+  previous: () => spotify.previous(),
+};
+for (const [action, run] of Object.entries(controls)) {
   router.post(`/${action}`, requireAuth, requireConnected, async (_req, res) => {
     try {
-      await spotify[action]();
+      await run();
       res.json({ ok: true });
     } catch (err) {
       sendError(res, err);
@@ -124,4 +189,14 @@ for (const action of ['pause', 'resume', 'next', 'previous']) {
   });
 }
 
-module.exports = router;
+// Music-only volume; works even without an active Spotify connection.
+router.post('/volume', requireAuth, (req, res) => {
+  const value = Number(req.body?.value);
+  if (!Number.isFinite(value)) {
+    res.status(400).json({ error: 'Invalid volume' });
+    return;
+  }
+  res.json({ ok: true, value: sessionManager.setMusicVolume(value) });
+});
+
+module.exports = { router, pausePlayback, resumePlayback, skipPlayback };

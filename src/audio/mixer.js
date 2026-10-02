@@ -57,7 +57,10 @@ class Mixer extends Readable {
     this._spotifyChunks = [];
     this._spotifyBuffered = 0;
     this._pendingWriteCb = null;
-    this._spotifyGain = 1; // 1 = full Spotify, 0 = muted under a clip
+    this._spotifyGain = 1; // 1 = full Spotify, 0 = muted (clip playing or paused locally)
+    this._musicMuted = false; // instant local pause while the Web API pause propagates
+    this._volume = 1; // user music volume (soundboard clips unaffected)
+    this._volumeTarget = 1;
     this._framesSent = 0;
     this._startedAt = null;
     this._timer = null;
@@ -108,11 +111,22 @@ class Mixer extends Readable {
     return true;
   }
 
+  /** Music-only volume, 0..1. Ramped over a few frames to avoid clicks. */
+  setMusicVolume(volume) {
+    this._volumeTarget = Math.min(1, Math.max(0, volume));
+  }
+
+  /** Instant local mute — perceived pause while the real pause propagates. */
+  setMusicMuted(muted) {
+    this._musicMuted = Boolean(muted);
+  }
+
   /** Snapshot for /api/status and WS broadcasts. */
   getState() {
     return {
       clip: this.clip ? { id: this.clip.id, name: this.clip.name } : null,
       spotifyActive: Date.now() - this.lastSpotifyDataAt < 1000,
+      musicMuted: this._musicMuted,
     };
   }
 
@@ -161,13 +175,20 @@ class Mixer extends Readable {
     // librespot keeps being paced at realtime.
     const spotifyFrame = this._takeSpotifyFrame();
 
-    // Ramp Spotify gain toward its target (0 under a clip, 1 otherwise).
-    const targetGain = this.clip ? 0 : 1;
+    // Ramp Spotify gain toward its target (0 under a clip or local pause).
+    const targetGain = (this.clip || this._musicMuted) ? 0 : 1;
     if (this._spotifyGain < targetGain) {
       this._spotifyGain = Math.min(1, this._spotifyGain + GAIN_STEP);
     } else if (this._spotifyGain > targetGain) {
       this._spotifyGain = Math.max(0, this._spotifyGain - GAIN_STEP);
     }
+    // Ramp the user volume too so slider jumps don't click.
+    if (this._volume < this._volumeTarget) {
+      this._volume = Math.min(this._volumeTarget, this._volume + GAIN_STEP);
+    } else if (this._volume > this._volumeTarget) {
+      this._volume = Math.max(this._volumeTarget, this._volume - GAIN_STEP);
+    }
+    const gain = this._spotifyGain * this._volume;
 
     let clipFrame = null;
     if (this.clip) {
@@ -182,19 +203,18 @@ class Mixer extends Readable {
       }
     }
 
-    // Fast path: pure Spotify (or pure silence) with no ramp in progress.
-    if (!clipFrame && this._spotifyGain === 1) {
+    // Fast path: pure Spotify (or pure silence) with no gain in effect.
+    if (!clipFrame && gain === 1) {
       this.push(spotifyFrame ?? SILENCE_FRAME);
       return;
     }
-    if (!clipFrame && this._spotifyGain === 0 && !spotifyFrame) {
+    if (!clipFrame && (gain === 0 || !spotifyFrame)) {
       this.push(SILENCE_FRAME);
       return;
     }
 
     // Blend path: out = clip + spotify * gain, clamped to Int16.
     const out = Buffer.alloc(FRAME_BYTES);
-    const gain = this._spotifyGain;
     for (let i = 0; i < SAMPLES_PER_FRAME; i++) {
       let sample = 0;
       if (spotifyFrame && gain > 0) sample += spotifyFrame.readInt16LE(i * 2) * gain;
