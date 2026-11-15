@@ -42,13 +42,6 @@ const config = {
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET?.trim() || null,
   },
 
-  // Audio format emitted by librespot's pipe backend.
-  audio: {
-    inputSampleRate: 44100, // librespot is fixed at 44.1 kHz
-    outputSampleRate: 48000, // Discord requires 48 kHz
-    channels: 2,
-  },
-
   // Soundboard web server (Express + WebSocket, same process).
   server: {
     enabled: (process.env.SOUNDBOARD_ENABLED ?? 'true').toLowerCase() !== 'false',

@@ -31,6 +31,17 @@ const SCOPES = ['user-read-playback-state', 'user-modify-playback-state', ...PLA
 const STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_RETRY_AFTER_S = 5;
 const MAX_PLAYLIST_ITEMS = 1000;
+/* GET /me/player keeps answering with the pre-command state for a while
+   after a command succeeds (measured live: reads sent up to ~0.35 s later
+   were stale). Within this window a read is only published if it shows the
+   command's outcome; otherwise every client flipped back to the old state
+   until the next 5 s poll. */
+const STALE_READ_MS = 1000;
+const REFRESH_AFTER_COMMAND_MS = [600, STALE_READ_MS + 500];
+/* Track changes the bot didn't ask for, with this much of the old track
+   left, are logged — "songs get skipped" reports need a culprit. */
+const EARLY_CHANGE_MS = 5000;
+const OWN_COMMAND_GRACE_MS = 5000;
 
 const tokenFile = path.join(dataDir, 'spotify-auth.json');
 
@@ -54,6 +65,10 @@ let fetchInFlightAt = 0;
 let lastLocalPauseAt = 0;
 /** Cached now-playing results older than this predate a command — stale. */
 let lastCommandAt = 0;
+/** @type {{at: number, test: (np: object) => boolean}|null} outcome the last command should produce */
+let expectation = null;
+/** @type {NodeJS.Timeout[]} */
+let refreshTimers = [];
 
 try {
   const saved = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
@@ -250,8 +265,13 @@ async function getDeviceId(force = false) {
   return deviceId;
 }
 
-/** Run a device-targeted call; retry once with a fresh device id on 404. */
-async function withDevice(fn) {
+/**
+ * Run a device-targeted call; retry once with a fresh device id on 404.
+ * @param {(deviceId: string) => Promise<unknown>} fn
+ * @param {((np: object) => boolean)|null} [expect] what the player state
+ *   looks like once this command has taken effect (see STALE_READ_MS)
+ */
+async function withDevice(fn, expect = null) {
   lastCommandAt = Date.now();
   try {
     await fn(await getDeviceId());
@@ -262,6 +282,7 @@ async function withDevice(fn) {
   } finally {
     lastCommandAt = Date.now();
   }
+  expectation = expect ? { at: lastCommandAt, test: expect } : null;
   scheduleNowPlayingRefresh();
 }
 
@@ -289,22 +310,37 @@ function getTrack(id) {
   return api('GET', `/tracks/${id}`).then(mapTrack);
 }
 
-const playUris = (uris) => withDevice((id) => api('PUT', '/me/player/play', { query: { device_id: id }, body: { uris } }));
+const currentUri = () => (lastNowPlaying?.active ? lastNowPlaying.track.uri : null);
+/** "A different track is on now" — unknowable without a known starting track. */
+const changedFrom = (before) => (before ? (np) => np.active && np.track.uri !== before : null);
+
+const playUris = (uris) => withDevice(
+  (id) => api('PUT', '/me/player/play', { query: { device_id: id }, body: { uris } }),
+  (np) => np.active && np.isPlaying && np.track.uri === uris[0],
+);
 const playUri = (uri) => playUris([uri]);
 /** Play a playlist/album as the context, so Spotify advances through it itself. */
 const playContext = (contextUri, position = 0) => withDevice((id) => api('PUT', '/me/player/play', {
   query: { device_id: id },
   body: { context_uri: contextUri, offset: { position }, position_ms: 0 },
-}));
+}), (np) => np.active && np.isPlaying && np.context?.uri === contextUri);
 /** Spotify's native queue: plays before the context continues. */
 const queueUri = (uri) => withDevice((id) => api('POST', '/me/player/queue', { query: { uri, device_id: id } }));
-const setShuffle = (state) => withDevice((id) => api('PUT', '/me/player/shuffle', { query: { state: Boolean(state), device_id: id } }));
+const setShuffle = (state) => withDevice(
+  (id) => api('PUT', '/me/player/shuffle', { query: { state: Boolean(state), device_id: id } }),
+  (np) => np.active && np.shuffle === Boolean(state),
+);
 const pause = () => {
   lastLocalPauseAt = Date.now();
-  return withDevice((id) => api('PUT', '/me/player/pause', { query: { device_id: id } }));
+  return withDevice((id) => api('PUT', '/me/player/pause', { query: { device_id: id } }), (np) => np.active && !np.isPlaying);
 };
-const resume = () => withDevice((id) => api('PUT', '/me/player/play', { query: { device_id: id } }));
-const next = () => withDevice((id) => api('POST', '/me/player/next', { query: { device_id: id } }));
+const resume = () => withDevice((id) => api('PUT', '/me/player/play', { query: { device_id: id } }), (np) => np.active && np.isPlaying);
+const next = () => {
+  const before = currentUri();
+  return withDevice((id) => api('POST', '/me/player/next', { query: { device_id: id } }), changedFrom(before));
+};
+// "Previous" may just restart the current track, so there's no reliable
+// expectation; the post-command refreshes settle it.
 const previous = () => withDevice((id) => api('POST', '/me/player/previous', { query: { device_id: id } }));
 
 /* ─────────────────────────── playlists ─────────────────────────── */
@@ -358,12 +394,19 @@ function logExternalChanges(prev, np) {
     console.warn(`[spotify] playback moved to another device ("${np.deviceName}") — the bot's Spotify account is being used elsewhere`);
     return;
   }
-  if (!np.isPlaying && np.track.uri === prev.track.uri && Date.now() - lastLocalPauseAt > 5000) {
-    const elapsed = Date.now() - (prev.fetchedAt ?? Date.now());
-    const remaining = prev.track.durationMs - (prev.progressMs ?? 0) - elapsed;
-    if (remaining > 3000) {
-      console.warn(`[spotify] playback paused outside the bot (device "${np.deviceName}") during "${np.track.name}"`);
+  const elapsed = Date.now() - (prev.fetchedAt ?? Date.now());
+  const remaining = prev.track.durationMs - (prev.progressMs ?? 0) - elapsed;
+  if (np.track.uri !== prev.track.uri) {
+    if (remaining > EARLY_CHANGE_MS && Date.now() - lastCommandAt > OWN_COMMAND_GRACE_MS) {
+      console.warn(
+        `[spotify] "${prev.track.name}" was cut short with ~${Math.round(remaining / 1000)}s left → "${np.track.name}" ` +
+        `(not by the bot: the Spotify app/another client skipped, or librespot couldn't play it)`,
+      );
     }
+    return;
+  }
+  if (!np.isPlaying && Date.now() - lastLocalPauseAt > 5000 && remaining > 3000) {
+    console.warn(`[spotify] playback paused outside the bot (device "${np.deviceName}") during "${np.track.name}"`);
   }
 }
 
@@ -411,6 +454,8 @@ async function fetchNowPlaying({ maxAgeMs = 0 } = {}) {
     // one sent before a command describes the player before it — publishing
     // it would flip every client back until the post-command refresh lands.
     if (lastNowPlaying?.requestedAt > requestedAt || requestedAt <= lastCommandAt) return np;
+    // Sent after the command but maybe still answered from before it.
+    if (expectation && requestedAt - expectation.at < STALE_READ_MS && !expectation.test(np)) return np;
     logExternalChanges(lastNowPlaying, np);
     lastNowPlaying = np;
     events.emit('nowplaying', np);
@@ -422,12 +467,20 @@ async function fetchNowPlaying({ maxAgeMs = 0 } = {}) {
   return request;
 }
 
-/** Refresh shortly after a control action, once Spotify's state settles. */
+/**
+ * Refresh after a control action: once early for a snappy UI (published
+ * only if it already shows the outcome), once after the stale window so the
+ * real state always lands even if the command didn't do what we expected.
+ */
 function scheduleNowPlayingRefresh() {
-  const timer = setTimeout(() => {
-    fetchNowPlaying().catch((err) => console.error(`[spotify] now-playing refresh failed: ${err.message}`));
-  }, 400);
-  timer.unref();
+  for (const t of refreshTimers) clearTimeout(t);
+  refreshTimers = REFRESH_AFTER_COMMAND_MS.map((ms) => {
+    const timer = setTimeout(() => {
+      fetchNowPlaying().catch((err) => console.error(`[spotify] now-playing refresh failed: ${err.message}`));
+    }, ms);
+    timer.unref();
+    return timer;
+  });
 }
 
 const getLastNowPlaying = () => lastNowPlaying;

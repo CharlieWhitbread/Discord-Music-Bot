@@ -26,7 +26,8 @@ Tests need Node ≥ 22 (the bot itself runs on Node ≥ 18); see
 in `web/` will be Vite + TypeScript.
 
 Runtime target is a **Raspberry Pi** (also runs on Windows/dev machines, but
-librespot must be installed separately; ffmpeg comes from `ffmpeg-static`).
+librespot must be installed separately; ffmpeg, used for clip uploads only,
+comes from `ffmpeg-static`).
 
 ## Architecture
 
@@ -34,9 +35,9 @@ librespot must be installed separately; ffmpeg comes from `ffmpeg-static`).
 
 ```
 Spotify app ──Connect──▶ librespot (--backend pipe, s16le/44.1kHz stdout)
-                             │
+                             │  one OS pipe
                              ▼
-                          ffmpeg (resample → s16le/48kHz stereo)
+                Resampler (src/audio/resampler.js, in-process → 48kHz)
                              │
                              ▼
                     Mixer (src/audio/mixer.js)  ◀── soundboard clip PCM
@@ -47,9 +48,16 @@ Spotify app ──Connect──▶ librespot (--backend pipe, s16le/44.1kHz stdo
 
 The Mixer is the single realtime pacer: a drift-compensated 20 ms clock
 emits exactly one 3840-byte frame per tick. Its `spotifyInput` Writable
-parks the write callback when >240 ms is buffered — that backpressure is
-what paces librespot. While a clip plays, Spotify PCM keeps being consumed
-but is gain-ramped to silence (60 ms fade), then blended back in.
+parks the write callback when >240 ms is buffered; sessionManager pauses
+librespot's stdout until it drains — that backpressure is what paces
+librespot. While a clip plays, Spotify PCM keeps being consumed but is
+gain-ramped to silence (60 ms fade), then blended back in.
+
+Keep buffering between librespot and the mixer minimal. librespot runs as
+far ahead as the buffers allow and reports *that* as its position; with
+an ffmpeg process in between it ran 5–7 s ahead of Discord, so pauses kept
+playing and positions jumped. A pause mutes the mixer until librespot's
+input goes quiet, then drops the unheard tail (`Mixer.muteUntilQuiet`).
 
 ### Files
 
@@ -58,9 +66,11 @@ but is gain-ramped to silence (60 ms fade), then blended back in.
   SIGINT/SIGTERM teardown).
 - `src/config.js` — env loading/validation (dotenv). All config comes from
   `.env`; never hardcode tokens or paths.
-- `src/audio/sessionManager.js` — owns the full per-guild session: librespot
-  + ffmpeg child processes, voice connection, player. `sessions` map keyed by
-  guildId (in practice a single guild is used).
+- `src/audio/sessionManager.js` — owns the full per-guild session: the
+  librespot child process, resampler, mixer, voice connection, player.
+  `sessions` map keyed by guildId (in practice a single guild is used).
+- `src/audio/resampler.js` — streaming polyphase windowed-sinc resampler,
+  44.1 → 48 kHz stereo s16le (exact 160/147 ratio).
 - `src/commands/*.js` — slash commands exporting `{ data, execute }`;
   auto-loaded by filename.
 - `src/deploy-commands.js` — registers slash commands (guild-scoped when
@@ -115,13 +125,14 @@ but is gain-ramped to silence (60 ms fade), then blended back in.
 2. **The AudioPlayer must never go idle.** When Spotify pauses, librespot
    stops writing; silence frames are injected (200 ms threshold) so
    @discordjs/voice never destroys the stream. The resource must NOT read
-   ffmpeg stdout directly.
+   librespot's output directly.
 3. **Teardown must be complete and idempotent.** Every child process, timer,
    stream and connection lives on the `Session` object; `destroySession` is
    guarded by `session.destroyed`. Any new resource (WS server, file
    handles, mixer timers) must be added to teardown.
-4. **EPIPE during shutdown races is expected** — swallow it on
-   ffmpeg.stdin/stdout error handlers; the process exit handlers do cleanup.
+4. **Stream errors during shutdown races are expected** — log them on the
+   librespot stdout error handler; the process exit handlers do cleanup.
+   PCM arriving after teardown is ignored (`session.destroyed`).
 5. **Discord requires 48 kHz stereo s16le** for `StreamType.Raw`. One frame =
    20 ms = 3840 bytes. All soundboard PCM must match exactly.
 6. **Errors must never kill the bot.** Child process failures tear down the

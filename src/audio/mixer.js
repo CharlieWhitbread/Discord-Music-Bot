@@ -6,7 +6,7 @@
  * Frame-based priority switcher that replaces the old PassThrough +
  * silence-timer stage. It is the single realtime pacer of the pipeline:
  *
- *   ffmpeg stdout ──pipe──▶ mixer.spotifyInput (Writable, capped buffer)
+ *   librespot → resampler ──write──▶ mixer.spotifyInput (Writable, capped buffer)
  *                                │  backpressure paces librespot
  *                                ▼
  *                         20 ms frame clock
@@ -32,7 +32,7 @@ const FRAME_MS = 20;
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
 
 // Spotify buffer cap: keeps browser-press→Discord latency bounded while
-// still giving librespot/ffmpeg room to write bursts.
+// still giving librespot room to write bursts.
 const SPOTIFY_BUFFER_HIGH = FRAME_BYTES * 12; // 240 ms
 const SPOTIFY_BUFFER_LOW = FRAME_BYTES * 6;
 
@@ -43,6 +43,14 @@ const GAIN_STEP = 1 / FADE_FRAMES;
 // After an event-loop stall, don't burst more than this many frames;
 // resynchronise the clock instead (drops the backlog).
 const MAX_FRAMES_PER_TICK = 5;
+
+// Pause mute: librespot has stopped once no PCM has arrived for this long.
+// While it's still playing, gaps between writes stay under ~150 ms (the
+// input cap releases at SPOTIFY_BUFFER_LOW), so this can't fire early.
+const QUIET_MS = 400;
+// If audio is still flowing this long after a pause, the pause didn't take
+// (failed, or someone resumed from the Spotify app) — don't stay silent.
+const PAUSE_MUTE_MAX_MS = 8000;
 
 class Mixer extends Readable {
   /** @param {string} label log prefix, e.g. the guild id */
@@ -59,6 +67,8 @@ class Mixer extends Readable {
     this._pendingWriteCb = null;
     this._spotifyGain = 1; // 1 = full Spotify, 0 = muted (clip playing or paused locally)
     this._musicMuted = false; // instant local pause while the Web API pause propagates
+    /** @type {number|null} when muteUntilQuiet() started; null when not in that mode */
+    this._quietMuteSince = null;
     this._volume = 1; // user music volume (soundboard clips unaffected)
     this._volumeTarget = 1;
     this._framesSent = 0;
@@ -66,7 +76,7 @@ class Mixer extends Readable {
     this._timer = null;
 
     const mixer = this;
-    /** Writable side for the ffmpeg → mixer pipe. */
+    /** Writable side fed with resampled librespot PCM. */
     this.spotifyInput = new Writable({
       highWaterMark: 1 << 14,
       write(chunk, _enc, cb) {
@@ -116,9 +126,21 @@ class Mixer extends Readable {
     this._volumeTarget = Math.min(1, Math.max(0, volume));
   }
 
-  /** Instant local mute — perceived pause while the real pause propagates. */
+  /** Instant local mute/unmute. Cancels a pending muteUntilQuiet(). */
   setMusicMuted(muted) {
     this._musicMuted = Boolean(muted);
+    this._quietMuteSince = null;
+  }
+
+  /**
+   * Perceived-instant pause. Mutes now and stays muted until librespot has
+   * actually stopped writing; whatever it wrote before stopping is then
+   * dropped unheard. A fixed-length mute let that buffered tail play out
+   * after the pause. Emits 'quietunmute' with reason 'quiet' | 'timeout'.
+   */
+  muteUntilQuiet() {
+    this._musicMuted = true;
+    this._quietMuteSince = Date.now();
   }
 
   /** Snapshot for /api/status and WS broadcasts. */
@@ -133,7 +155,7 @@ class Mixer extends Readable {
   _destroy(err, cb) {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
-    // Release a parked ffmpeg write so the pipe can unwind during teardown.
+    // Release a parked upstream write so the pipeline can unwind during teardown.
     if (this._pendingWriteCb) {
       const pending = this._pendingWriteCb;
       this._pendingWriteCb = null;
@@ -157,6 +179,7 @@ class Mixer extends Readable {
 
   _tick() {
     if (this.destroyed) return;
+    if (this._quietMuteSince !== null) this._checkQuietMute();
     const owed = Math.floor((Date.now() - this._startedAt) / FRAME_MS) - this._framesSent;
     if (owed <= 0) return;
     const n = Math.min(owed, MAX_FRAMES_PER_TICK);
@@ -167,6 +190,33 @@ class Mixer extends Readable {
     if (owed > MAX_FRAMES_PER_TICK) {
       // Event-loop stall: drop the backlog rather than bursting audio.
       this._framesSent = Math.floor((Date.now() - this._startedAt) / FRAME_MS);
+    }
+  }
+
+  _checkQuietMute() {
+    const now = Date.now();
+    const quietFor = now - Math.max(this.lastSpotifyDataAt, this._quietMuteSince);
+    let reason = null;
+    if (quietFor >= QUIET_MS) {
+      this._dropSpotifyBuffer();
+      reason = 'quiet';
+    } else if (now - this._quietMuteSince >= PAUSE_MUTE_MAX_MS) {
+      reason = 'timeout';
+    }
+    if (!reason) return;
+    this._quietMuteSince = null;
+    this._musicMuted = false;
+    this.emit('quietunmute', reason);
+  }
+
+  /** Discard buffered Spotify PCM and release a parked upstream write. */
+  _dropSpotifyBuffer() {
+    this._spotifyChunks = [];
+    this._spotifyBuffered = 0;
+    if (this._pendingWriteCb) {
+      const cb = this._pendingWriteCb;
+      this._pendingWriteCb = null;
+      cb();
     }
   }
 
@@ -251,7 +301,7 @@ class Mixer extends Readable {
     }
     this._spotifyBuffered -= FRAME_BYTES;
 
-    // Drained below the low-water mark — let ffmpeg resume writing.
+    // Drained below the low-water mark — let librespot resume writing.
     if (this._pendingWriteCb && this._spotifyBuffered <= SPOTIFY_BUFFER_LOW) {
       const cb = this._pendingWriteCb;
       this._pendingWriteCb = null;

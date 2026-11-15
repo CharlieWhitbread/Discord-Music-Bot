@@ -217,6 +217,70 @@ describe('volume and local mute', () => {
   });
 });
 
+describe('pause mute (muteUntilQuiet)', () => {
+  /** librespot still playing: keep feeding the input every frame. */
+  function feedWhile(n, value = 3000) {
+    for (let i = 0; i < n; i++) {
+      mixer.spotifyInput.write(constFrame(value));
+      tickFrames(1);
+    }
+  }
+
+  test('stays muted while librespot keeps writing — the buffered tail is never heard', () => {
+    const unmutes = [];
+    mixer.on('quietunmute', (r) => unmutes.push(r));
+    feedWhile(3);
+    mixer.muteUntilQuiet();
+    feedWhile(100); // 2 s of tail still arriving, far past the old fixed 2 s mute
+    assert.ok(frames.slice(6).every(isSilent), 'nothing audible after the fade');
+    assert.deepEqual(unmutes, []);
+    assert.equal(mixer.getState().musicMuted, true);
+  });
+
+  test('unmutes once the input has been quiet, dropping what is still buffered', () => {
+    const unmutes = [];
+    mixer.on('quietunmute', (r) => unmutes.push(r));
+    mixer.spotifyInput.write(constFrame(3000, 30)); // 600 ms tail in one last big write
+    mixer.muteUntilQuiet();
+    tickFrames(19); // 380 ms of quiet
+    assert.deepEqual(unmutes, []);
+    tickFrames(2);
+    assert.deepEqual(unmutes, ['quiet']);
+    assert.equal(mixer._spotifyBuffered, 0, 'unheard tail dropped, not played after the unmute');
+    assert.equal(mixer.getState().musicMuted, false);
+    // Resumed music is audible again.
+    feedWhile(4, 2000);
+    assert.equal(firstSample(frames.at(-1)), 2000);
+  });
+
+  test('a parked upstream write is released when the tail is dropped', () => {
+    const acked = write(constFrame(3000, 20)); // over the 240 ms cap → parked
+    assert.equal(acked(), false);
+    mixer.muteUntilQuiet();
+    tickFrames(25);
+    assert.equal(acked(), true);
+  });
+
+  test('gives up after 8 s if music keeps flowing (pause failed / resumed elsewhere)', () => {
+    const unmutes = [];
+    mixer.on('quietunmute', (r) => unmutes.push(r));
+    mixer.muteUntilQuiet();
+    feedWhile(8000 / FRAME_MS + 2);
+    assert.deepEqual(unmutes, ['timeout']);
+    assert.equal(mixer.getState().musicMuted, false);
+  });
+
+  test('setMusicMuted(false) (resume) cancels it immediately', () => {
+    const unmutes = [];
+    mixer.on('quietunmute', (r) => unmutes.push(r));
+    mixer.muteUntilQuiet();
+    mixer.setMusicMuted(false);
+    tickFrames(30);
+    assert.deepEqual(unmutes, [], 'no later auto-unmute event');
+    assert.equal(mixer.getState().musicMuted, false);
+  });
+});
+
 describe('state and teardown', () => {
   test('getState reports spotifyActive for 1 s after the last write', () => {
     assert.equal(mixer.getState().spotifyActive, false);

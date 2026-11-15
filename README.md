@@ -6,17 +6,20 @@ from Spotify directly into a Discord voice channel.
 ## How it works
 
 ```
-Spotify app ──(Spotify Connect)──▶ librespot ──(raw PCM s16le/44.1kHz)──▶ ffmpeg
+Spotify app ──(Spotify Connect)──▶ librespot ──(raw PCM s16le/44.1kHz)──▶ resampler
                                                                             │
                                               (raw PCM s16le/48kHz, stereo) ▼
-Discord voice channel ◀── AudioPlayer ◀── AudioResource (StreamType.Raw)
+Discord voice channel ◀── AudioPlayer ◀── AudioResource ◀── mixer (+ soundboard clips)
 ```
 
 - `librespot` runs with `--backend pipe` and appears as a device in your
   Spotify Connect device list. Whatever you play to it is written to stdout
   as raw PCM (S16LE, 44 100 Hz, 2 channels).
-- Discord requires 48 kHz audio, so a bundled `ffmpeg` (via `ffmpeg-static`)
-  resamples the stream before it is handed to `@discordjs/voice`.
+- Discord requires 48 kHz audio, so an in-process resampler converts the
+  stream before the mixer hands it to `@discordjs/voice`. (A separate ffmpeg
+  process used to do this, but its buffering made librespot run seconds
+  ahead of what Discord played.) ffmpeg (`ffmpeg-static`) is still used to
+  process soundboard uploads.
 
 ## Project structure
 
@@ -35,7 +38,8 @@ Discord-Music-Bot/
     │   ├── sound.js          # /sound — play a soundboard clip
     │   └── stopsound.js      # /stopsound — stop the current clip
     ├── audio/
-    │   ├── sessionManager.js # librespot + ffmpeg + voice lifecycle
+    │   ├── sessionManager.js # librespot + resampler + voice lifecycle
+    │   ├── resampler.js      # 44.1 → 48 kHz, in-process
     │   └── mixer.js          # realtime frame clock; mutes Spotify under clips
     └── server/               # Express API + WebSocket (soundboard backend)
 ```
@@ -129,10 +133,10 @@ full design.
    verify with `/join` then `/sound test`.
 ## Error handling & resilience
 
-- **Child process failures** — `error`/`exit` events on both librespot and
-  ffmpeg trigger a full, idempotent session teardown instead of crashing.
-- **Stream errors** — `stdout`/`stdin` `error` events (including `EPIPE`
-  during shutdown races) are caught and logged.
+- **Child process failures** — `error`/`exit` events on librespot trigger a
+  full, idempotent session teardown instead of crashing.
+- **Stream errors** — `stdout` `error` events (e.g. during shutdown races)
+  are caught and logged.
 - **Voice disconnects** — channel moves and transient WebSocket closes get a
   bounded reconnect window; genuine kicks tear the session down.
 - **Process-level nets** — `unhandledRejection` / `uncaughtException` are

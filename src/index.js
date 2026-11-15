@@ -74,7 +74,7 @@ process.on('uncaughtException', (err) => {
   console.error('[process] uncaught exception:', err);
 });
 
-// Graceful shutdown: kill librespot/ffmpeg and leave voice cleanly.
+// Graceful shutdown: kill librespot and leave voice cleanly.
 function shutdown(signal) {
   console.log(`[process] received ${signal}, shutting down`);
   soundboardServer.stop();

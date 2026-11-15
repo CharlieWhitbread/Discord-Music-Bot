@@ -8,13 +8,18 @@
  *   librespot (child process, --backend pipe)
  *        │  raw PCM  s16le / 44100 Hz / 2ch  (stdout)
  *        ▼
- *   ffmpeg (child process)
- *        │  raw PCM  s16le / 48000 Hz / 2ch  (stdout)  ← Discord's required rate
+ *   Resampler (in-process) → s16le / 48000 Hz / 2ch  ← Discord's required rate
  *        ▼
- *   AudioResource (StreamType.Raw) → AudioPlayer → VoiceConnection
+ *   Mixer → AudioResource (StreamType.Raw) → AudioPlayer → VoiceConnection
  *
- * Every external resource (two child processes + one voice connection) is
- * tracked in a Session object so that teardown is always complete and
+ * Resampling used to be an ffmpeg child process. librespot has no clock:
+ * it writes as fast as the buffers downstream accept, and ffmpeg plus two
+ * OS pipes held seconds of audio, so librespot ran 5–7 s ahead of Discord.
+ * Pauses kept playing and Spotify's reported position jumped. Now the only
+ * buffers are one OS pipe and the mixer's capped input.
+ *
+ * Every external resource (the librespot process and the voice connection)
+ * is tracked in a Session object so that teardown is always complete and
  * idempotent, no matter which component fails first.
  */
 
@@ -32,9 +37,9 @@ const {
   NoSubscriberBehavior,
   StreamType,
 } = require('@discordjs/voice');
-const ffmpegPath = require('ffmpeg-static');
 const config = require('../config');
 const { Mixer } = require('./mixer');
+const { Resampler } = require('./resampler');
 
 /** @type {Map<string, Session>} guildId → active session */
 const sessions = new Map();
@@ -50,7 +55,7 @@ const events = new EventEmitter();
  * @property {import('@discordjs/voice').VoiceConnection} connection
  * @property {import('@discordjs/voice').AudioPlayer} player
  * @property {import('node:child_process').ChildProcess|null} librespot
- * @property {import('node:child_process').ChildProcess|null} ffmpeg
+ * @property {import('./resampler').Resampler|null} resampler
  * @property {import('./mixer').Mixer|null} mixer
  * @property {boolean} destroyed  Guard flag making destroySession idempotent.
  */
@@ -91,39 +96,6 @@ function spawnLibrespot() {
   return child;
 }
 
-/**
- * Spawn ffmpeg to resample librespot's 44.1 kHz PCM to the 48 kHz PCM that
- * Discord's Opus encoder expects. Both sides are raw s16le streams, so the
- * input format must be declared explicitly (raw PCM has no header).
- */
-function spawnFfmpeg() {
-  const args = [
-    '-hide_banner',
-    '-loglevel', 'error',
-    // Input: raw PCM from librespot
-    '-f', 's16le',
-    '-ar', String(config.audio.inputSampleRate),
-    '-ac', String(config.audio.channels),
-    '-i', 'pipe:0',
-    // Output: raw PCM for @discordjs/voice (StreamType.Raw)
-    '-f', 's16le',
-    '-ar', String(config.audio.outputSampleRate),
-    '-ac', String(config.audio.channels),
-    'pipe:1',
-  ];
-
-  const child = spawn(ffmpegPath, args, {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-
-  child.stderr.on('data', (chunk) => {
-    const line = chunk.toString().trim();
-    if (line) console.error(`[ffmpeg] ${line}`);
-  });
-
-  return child;
-}
-
 /* ─────────────────────────── public API ─────────────────────────── */
 
 /**
@@ -144,7 +116,7 @@ async function createSession(voiceChannel) {
     connection: null,
     player: null,
     librespot: null,
-    ffmpeg: null,
+    resampler: null,
     mixer: null,
     destroyed: false,
   };
@@ -173,34 +145,18 @@ async function createSession(voiceChannel) {
     // Fail fast if the gateway handshake doesn't complete.
     await entersState(session.connection, VoiceConnectionStatus.Ready, 20_000);
 
-    /* 2 ─ Spawn the audio pipeline */
+    /* 2 ─ Spawn librespot */
     session.librespot = spawnLibrespot();
-    session.ffmpeg = spawnFfmpeg();
-
     wireProcessEvents(session, guildId);
-
-    // librespot PCM → ffmpeg stdin. { end: false } is deliberate: librespot
-    // pauses its output between tracks and we must not close ffmpeg's stdin
-    // when that happens... but 'end' only fires on true stream end, so the
-    // default is fine; we keep it explicit for clarity.
-    session.librespot.stdout.pipe(session.ffmpeg.stdin);
-
-    // Swallow EPIPE that occurs if ffmpeg dies while librespot is writing —
-    // the process 'exit' handlers below perform the actual cleanup.
-    session.ffmpeg.stdin.on('error', (err) => {
-      if (err.code !== 'EPIPE') {
-        console.error(`[ffmpeg] stdin error: ${err.message}`);
-      }
-    });
 
     /* 3 ─ Build player + resource from the mixer.
      *
-     * The resource must NOT read ffmpeg.stdout directly: when Spotify is
-     * paused, librespot stops writing PCM, the player would go Idle and
-     * @discordjs/voice would destroy the stream — breaking ffmpeg's pipe and
-     * killing the whole session. The mixer emits a frame every 20 ms no
-     * matter what (Spotify / soundboard clip / silence) and its capped input
-     * buffer provides the backpressure that paces librespot. */
+     * The resource must NOT read librespot's output directly: when Spotify
+     * is paused, librespot stops writing PCM, the player would go Idle and
+     * @discordjs/voice would destroy the stream, killing the whole session.
+     * The mixer emits a frame every 20 ms no matter what (Spotify /
+     * soundboard clip / silence) and its capped input buffer provides the
+     * backpressure that paces librespot. */
     session.mixer = new Mixer(guildId);
     session.mixer.setMusicVolume(musicVolume / 100);
     session.mixer.on('error', (err) => {
@@ -214,8 +170,26 @@ async function createSession(voiceChannel) {
       console.log(`[mixer:${guildId}] clip ended: ${clip.name}`);
       emitStatus();
     });
+    session.mixer.on('quietunmute', (reason) => {
+      if (reason === 'timeout') {
+        console.warn(`[mixer:${guildId}] music still playing after a pause — unmuting (pause failed or resumed elsewhere)`);
+      }
+    });
 
-    session.ffmpeg.stdout.pipe(session.mixer.spotifyInput, { end: false });
+    /* librespot → resampler → mixer. Pausing librespot's stdout when the
+     * mixer's input is full is the backpressure; it never stops for long
+     * because the mixer drains at realtime (invariant 1). */
+    session.resampler = new Resampler();
+    const input = session.mixer.spotifyInput;
+    const stdout = session.librespot.stdout;
+    stdout.on('data', (chunk) => {
+      if (session.destroyed) return;
+      const pcm = session.resampler.process(chunk);
+      if (pcm.length && !input.write(pcm)) stdout.pause();
+    });
+    input.on('drain', () => {
+      if (!session.destroyed) stdout.resume();
+    });
 
     session.player = createAudioPlayer({
       behaviors: {
@@ -269,14 +243,13 @@ function destroySession(guildId) {
     session.mixer?.destroy();
   } catch { /* stream already closed */ }
 
-  // Unpipe before killing to avoid write-after-end errors.
+  // Stop reading before the kill; the 'data' handler also checks destroyed.
   try {
-    session.librespot?.stdout?.unpipe();
-    session.ffmpeg?.stdout?.unpipe();
+    session.librespot?.stdout?.removeAllListeners('data');
+    session.librespot?.stdout?.pause();
   } catch { /* stream already closed */ }
 
   killProcess(session.librespot, 'librespot');
-  killProcess(session.ffmpeg, 'ffmpeg');
 
   try {
     if (session.connection && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -341,11 +314,19 @@ function setMusicVolume(value) {
   return musicVolume;
 }
 
-/** Instantly mute/unmute music while the real Spotify pause propagates. */
+/** Instantly mute/unmute music (unmuting also cancels a pause mute). */
 function setSpotifyMuted(muted) {
   const session = getActiveSession();
   if (!session) return false;
   session.mixer.setMusicMuted(muted);
+  return true;
+}
+
+/** Pause mute: silent until librespot has actually stopped (see Mixer). */
+function muteSpotifyUntilQuiet() {
+  const session = getActiveSession();
+  if (!session) return false;
+  session.mixer.muteUntilQuiet();
   return true;
 }
 
@@ -393,7 +374,7 @@ function killProcess(child, label) {
  * @param {string} guildId
  */
 function wireProcessEvents(session, guildId) {
-  const { librespot, ffmpeg } = session;
+  const { librespot } = session;
 
   librespot.on('error', (err) => {
     // e.g. ENOENT when the binary path is wrong
@@ -408,20 +389,6 @@ function wireProcessEvents(session, guildId) {
 
   librespot.stdout.on('error', (err) => {
     console.error(`[librespot] stdout error: ${err.message}`);
-  });
-
-  ffmpeg.on('error', (err) => {
-    console.error(`[ffmpeg] failed to start: ${err.message}`);
-    destroySession(guildId);
-  });
-
-  ffmpeg.on('exit', (code, signal) => {
-    console.log(`[ffmpeg] exited (code=${code}, signal=${signal})`);
-    if (!session.destroyed) destroySession(guildId);
-  });
-
-  ffmpeg.stdout.on('error', (err) => {
-    console.error(`[ffmpeg] stdout error: ${err.message}`);
   });
 }
 
@@ -478,8 +445,8 @@ function wireConnectionEvents(session, guildId) {
 function wirePlayerEvents(session, guildId) {
   session.player.on('error', (err) => {
     console.error(`[player:${guildId}] error: ${err.message}`);
-    // The underlying ffmpeg stream is dead; process exit handlers will
-    // trigger the actual teardown. Nothing else to do here.
+    // The mixer stream itself is dead; librespot's exit handler or the
+    // connection handlers trigger the actual teardown.
   });
 
   session.player.on(AudioPlayerStatus.Playing, () => {
@@ -502,6 +469,7 @@ module.exports = {
   stopClip,
   setMusicVolume,
   setSpotifyMuted,
+  muteSpotifyUntilQuiet,
   getStatus,
   events,
 };

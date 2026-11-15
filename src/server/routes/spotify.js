@@ -22,27 +22,32 @@ const router = express.Router();
 const TRACK_URI = /^spotify:track:[A-Za-z0-9]{22}$/;
 
 /**
- * Instant-feel pause: mute the mixer locally right away, then send the
- * real pause. The mute is only a bridge over the Web API's latency, so it
- * releases itself once librespot has had time to stop producing PCM —
- * a mute left on after a resume from the Spotify app (or a queue/playlist
- * starting) was the "says it's playing but there's no sound" bug.
+ * Instant-feel pause: mute the mixer right away, then send the real pause.
+ * The mixer stays muted until librespot has actually stopped writing, then
+ * drops the unheard tail (a fixed 2 s mute let seconds of buffered audio
+ * play after the pause). It never stays muted while music plays: a resume
+ * from anywhere (here, the Spotify app, a queue/playlist starting) unmutes,
+ * and the mixer gives up after a few seconds if audio keeps flowing. A mute
+ * left on was the "says it's playing but there's no sound" bug.
  * Shared by the HTTP route and the WebSocket handler.
  */
-const PAUSE_MUTE_MS = 2000;
-let unmuteTimer = null;
+// Player reads sent this soon after a command can still be stale (measured
+// up to ~0.35 s); only a later "playing" means someone really resumed.
+const RESUMED_ELSEWHERE_AFTER_MS = 1500;
+let pausedAt = 0;
 
 function unmute() {
-  clearTimeout(unmuteTimer);
-  unmuteTimer = null;
+  pausedAt = 0;
   sessionManager.setSpotifyMuted(false);
 }
 
+spotify.events.on('nowplaying', (np) => {
+  if (pausedAt && np.active && np.isPlaying && np.requestedAt - pausedAt > RESUMED_ELSEWHERE_AFTER_MS) unmute();
+});
+
 async function pausePlayback() {
-  sessionManager.setSpotifyMuted(true);
-  clearTimeout(unmuteTimer);
-  unmuteTimer = setTimeout(unmute, PAUSE_MUTE_MS);
-  unmuteTimer.unref();
+  sessionManager.muteSpotifyUntilQuiet();
+  pausedAt = Date.now();
   try {
     await spotify.pause();
   } catch (err) {

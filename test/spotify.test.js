@@ -294,6 +294,110 @@ describe('account linking', () => {
   });
 });
 
+describe('stale reads after a command (measured live: up to ~0.35 s)', () => {
+  /**
+   * Make GET /me/player answer with the state from just before the last
+   * player command for `lagMs`, like the real API does.
+   */
+  function laggingReads(lagMs) {
+    let snapshot = null;
+    let commandAt = -Infinity;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      const method = (init.method ?? 'GET').toUpperCase();
+      const isPlayerUrl = /\/v1\/me\/player(\/(play|pause|next|previous|shuffle))?(\?|$)/.test(url);
+      if (isPlayerUrl && method === 'GET' && snapshot && Date.now() - commandAt < lagMs) {
+        return new Response(snapshot.body, { status: snapshot.status, headers: { 'content-type': 'application/json' } });
+      }
+      if (isPlayerUrl && method !== 'GET') {
+        const before = await fake.fetch('https://api.spotify.com/v1/me/player', { headers: init.headers });
+        snapshot = { status: before.status, body: before.status === 204 ? null : await before.text() };
+        const res = await fake.fetch(input, init);
+        commandAt = Date.now();
+        return res;
+      }
+      return fake.fetch(input, init);
+    };
+  }
+
+  async function playingAndPublished() {
+    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 20_000_000 });
+    await spotify.playUris([fake.catalog.values().next().value.uri]);
+    await advance(mock.timers, 2000);
+    await spotify.fetchNowPlaying();
+    assert.equal(spotify.getLastNowPlaying().isPlaying, true);
+    const published = [];
+    spotify.events.on('nowplaying', (np) => published.push(np.active ? np.isPlaying : 'inactive'));
+    return published;
+  }
+
+  test('a stale "still playing" right after pause is not published; the follow-up refresh is', async () => {
+    const published = await playingAndPublished();
+    laggingReads(350);
+    await spotify.pause();
+    await advance(mock.timers, 100, 50);
+    const stale = await spotify.fetchNowPlaying();
+    assert.equal(stale.isPlaying, true, 'Spotify still answers "playing"');
+    assert.deepEqual(published, [], 'not pushed to the website');
+    await advance(mock.timers, 1600, 50); // the 600 ms and 1500 ms refreshes
+    assert.ok(published.length > 0 && !published.includes(true), `published ${JSON.stringify(published)}`);
+    assert.equal(spotify.getLastNowPlaying().isPlaying, false);
+  });
+
+  test('the same for resume, next and shuffle', async () => {
+    const published = await playingAndPublished();
+    await spotify.pause();
+    await advance(mock.timers, 2000);
+    laggingReads(350);
+    published.length = 0;
+
+    await spotify.resume();
+    await advance(mock.timers, 100);
+    await spotify.fetchNowPlaying();
+    assert.deepEqual(published, [], 'stale "paused" not published');
+    await advance(mock.timers, 1600);
+    assert.equal(published.at(-1), true);
+
+    const uris = [];
+    spotify.events.on('nowplaying', (np) => uris.push(np.track?.uri));
+    const before = spotify.getLastNowPlaying().track.uri;
+    await spotify.playUris([...fake.catalog.values()].slice(0, 3).map((t) => t.uri));
+    await advance(mock.timers, 2000);
+    uris.length = 0;
+    await spotify.next();
+    await advance(mock.timers, 100);
+    await spotify.fetchNowPlaying();
+    assert.ok(!uris.includes(before), 'old track not re-published after next');
+    await advance(mock.timers, 1600);
+    assert.notEqual(spotify.getLastNowPlaying().track.uri, before);
+
+    const shuffles = [];
+    spotify.events.on('nowplaying', (np) => shuffles.push(np.shuffle));
+    await spotify.setShuffle(true);
+    await advance(mock.timers, 100);
+    await spotify.fetchNowPlaying();
+    assert.ok(!shuffles.includes(false), 'stale shuffle=false not published');
+    await advance(mock.timers, 1600);
+    assert.equal(spotify.getLastNowPlaying().shuffle, true);
+  });
+
+  test('a read already showing the outcome is published straight away', async () => {
+    const published = await playingAndPublished();
+    await spotify.pause(); // no lag
+    await advance(mock.timers, 50, 10);
+    await spotify.fetchNowPlaying();
+    assert.equal(published[0], false, 'published before any refresh timer');
+  });
+
+  test('if the command never takes effect, the real state still lands after the window', async () => {
+    const published = await playingAndPublished();
+    fake.fail('PUT', '/me/player/pause', 204, {}); // "succeeds" but does nothing
+    await spotify.pause();
+    await advance(mock.timers, 1600, 50);
+    assert.equal(published.at(-1), true, 'website shows the truth: still playing');
+  });
+});
+
 describe('logExternalChanges', () => {
   async function playing() {
     mock.timers.reset();
@@ -315,6 +419,27 @@ describe('logExternalChanges', () => {
     await playing();
     await spotify.pause();
     await advance(mock.timers, 500);
+    await spotify.fetchNowPlaying();
+    assert.deepEqual(logs.warn, []);
+  });
+
+  test('warns when a track is cut short by something other than the bot', async () => {
+    await playing();
+    const other = [...fake.catalog.values()][2].uri;
+    fake.start({ uris: [other] }); // e.g. ⏭ in the Spotify app
+    await spotify.fetchNowPlaying();
+    assert.ok(logs.warn.some((l) => /cut short with ~\d+s left/.test(l) && /not by the bot/.test(l)), logs.warn.join('\n'));
+  });
+
+  test('does not warn for the bot’s own skip', async () => {
+    await playing();
+    const uris = [...fake.catalog.values()].slice(0, 3).map((t) => t.uri);
+    await spotify.playUris(uris);
+    await advance(mock.timers, 6000, 500);
+    await spotify.fetchNowPlaying();
+    logs.warn.length = 0;
+    await spotify.next();
+    await advance(mock.timers, 2000);
     await spotify.fetchNowPlaying();
     assert.deepEqual(logs.warn, []);
   });

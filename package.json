@@ -9,6 +9,7 @@
     "test-clip": "node scripts/make-test-clip.js",
     "test": "node --test \"test/*.test.js\"",
     "test:live": "node --test \"test/live/*.test.js\"",
+    "test:spotify-live": "node scripts/spotify-live-check.js",
     "test:web": "npm --prefix web test",
     "test:all": "npm test && npm run test:web"
   },

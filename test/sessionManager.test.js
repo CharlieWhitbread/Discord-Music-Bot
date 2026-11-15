@@ -31,16 +31,15 @@ afterEach(async () => {
 
 async function join() {
   const result = await sessionManager.createSession(channel());
-  const [librespot, ffmpeg] = spawner.children;
+  const [librespot] = spawner.children;
   const session = sessionManager.getActiveSession();
-  return { result, librespot, ffmpeg, session, connection: voice.created.connections.at(-1) };
+  return { result, librespot, session, connection: voice.created.connections.at(-1) };
 }
 
-function assertTornDown({ librespot, ffmpeg, session, connection }) {
+function assertTornDown({ librespot, session, connection }) {
   assert.equal(sessionManager.hasSession(GUILD), false);
   assert.equal(session.destroyed, true);
   assert.ok(librespot.killed || librespot.exitCode !== null, 'librespot killed');
-  assert.ok(ffmpeg.killed || ffmpeg.exitCode !== null, 'ffmpeg killed');
   assert.equal(session.mixer.destroyed, true, 'mixer destroyed');
   assert.equal(session.mixer._timer, null, 'mixer clock cleared');
   assert.equal(session.player.stopped, true, 'player stopped');
@@ -48,18 +47,18 @@ function assertTornDown({ librespot, ffmpeg, session, connection }) {
 }
 
 describe('createSession', () => {
-  test('wires librespot → ffmpeg → mixer → player and reports status', async () => {
+  test('wires librespot → resampler → mixer → player and reports status', async () => {
     const statuses = [];
     sessionManager.events.on('status', (s) => statuses.push(s));
-    const { result, librespot, ffmpeg, session, connection } = await join();
+    const { result, librespot, session, connection } = await join();
     sessionManager.events.removeAllListeners('status');
 
     assert.deepEqual(result, { created: true });
     assert.equal(librespot.bin, 'fake-librespot');
     assert.ok(librespot.args.includes('pipe'), 'librespot uses the pipe backend');
-    assert.ok(ffmpeg.args.includes('48000'), 'ffmpeg resamples to 48 kHz');
+    assert.equal(spawner.children.length, 1, 'no ffmpeg process in the music path');
     assert.equal(connection.subscribed, session.player);
-    // Invariant 2: the resource reads the mixer, never ffmpeg stdout.
+    // Invariant 2: the resource reads the mixer, never librespot's output.
     assert.equal(voice.created.resources.at(-1).stream, session.mixer);
     assert.equal(voice.created.resources.at(-1).opts.inputType, 'raw');
     assert.equal(statuses.at(-1).inVoice, true);
@@ -70,7 +69,7 @@ describe('createSession', () => {
     await join();
     const again = await sessionManager.createSession(channel());
     assert.deepEqual(again, { created: false });
-    assert.equal(spawner.children.length, 2, 'no extra processes');
+    assert.equal(spawner.children.length, 1, 'no extra processes');
   });
 
   test('a voice handshake failure leaks nothing and rethrows', async () => {
@@ -83,7 +82,7 @@ describe('createSession', () => {
 });
 
 describe('teardown (invariant 3)', () => {
-  test('destroySession kills both processes, the mixer, player and connection', async () => {
+  test('destroySession kills librespot, the mixer, player and connection', async () => {
     const ctx = await join();
     assert.equal(sessionManager.destroySession(GUILD), true);
     assertTornDown(ctx);
@@ -97,14 +96,11 @@ describe('teardown (invariant 3)', () => {
     await flush(); // child 'exit' events fire after the kill
     assert.equal(ctx.connection.destroyCount, 1);
     assert.equal(ctx.librespot.signals.length, 1);
-    assert.equal(ctx.ffmpeg.signals.length, 1);
   });
 
   for (const [label, fail] of [
     ['librespot exits', (c) => c.librespot.exit(1)],
-    ['ffmpeg exits', (c) => c.ffmpeg.exit(1)],
     ['librespot fails to spawn (ENOENT)', (c) => c.librespot.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))],
-    ['ffmpeg emits error', (c) => c.ffmpeg.emit('error', new Error('boom'))],
     ['the voice connection is destroyed', (c) => c.connection.destroy()],
     ['Discord disconnects and the reconnect fails', (c) => c.connection.setStatus('disconnected', { reason: 1 })],
     ['Discord kicks the bot (4014)', (c) => c.connection.setStatus('disconnected', { reason: 0, closeCode: 4014 })],
@@ -126,13 +122,9 @@ describe('teardown (invariant 3)', () => {
     assert.equal(sessionManager.hasSession(GUILD), true);
   });
 
-  test('EPIPE on ffmpeg stdin during shutdown is swallowed (invariant 4)', async () => {
+  test('stream errors on librespot stdout are logged, not fatal', async () => {
     const ctx = await join();
-    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
-    ctx.ffmpeg.stdin.emit('error', epipe);
-    ctx.ffmpeg.stdout.emit('error', new Error('stdout closed'));
     ctx.librespot.stdout.emit('error', new Error('stdout closed'));
-    assert.ok(!logs.error.some((l) => l.includes('EPIPE')), 'EPIPE not even logged');
     assert.equal(sessionManager.hasSession(GUILD), true, 'stream errors alone do not tear down');
   });
 
@@ -142,11 +134,40 @@ describe('teardown (invariant 3)', () => {
     assert.equal(sessionManager.hasSession(GUILD), true);
   });
 
-  test('librespot PCM flows through ffmpeg into the mixer', async () => {
+  test('librespot PCM is resampled to 48 kHz into the mixer', async () => {
     const ctx = await join();
-    ctx.ffmpeg.stdout.write(Buffer.alloc(3840, 1));
+    const input = ctx.session.mixer.spotifyInput;
+    let written = 0;
+    const write = input.write.bind(input);
+    input.write = (chunk, ...rest) => { written += chunk.length; return write(chunk, ...rest); };
+    // 1 s of 44.1 kHz stereo s16le in odd-sized chunks → ~1 s at 48 kHz.
+    const second = Buffer.alloc(44100 * 4, 1);
+    for (let o = 0; o < second.length; o += 7001) {
+      ctx.librespot.stdout.write(second.subarray(o, o + 7001));
+      await flush();
+      ctx.session.mixer._dropSpotifyBuffer(); // play it out so backpressure never stalls the test
+      await flush();
+    }
+    assert.ok(Math.abs(written / 4 - 48000) <= 32, `~48000 frames, got ${written / 4}`);
+  });
+
+  test('a full mixer pauses librespot (backpressure) and a drain resumes it', async () => {
+    const ctx = await join();
+    const stdout = ctx.librespot.stdout;
+    stdout.write(Buffer.alloc(44100 * 4)); // 1 s ≫ the mixer's 240 ms cap
     await flush();
-    assert.equal(ctx.session.mixer._spotifyBuffered, 3840);
+    assert.equal(stdout.isPaused(), true, 'librespot output paused');
+    ctx.session.mixer._dropSpotifyBuffer(); // the mixer catching up
+    await flush();
+    assert.equal(stdout.isPaused(), false, 'reading resumes after drain');
+  });
+
+  test('PCM arriving after teardown is ignored', async () => {
+    const ctx = await join();
+    sessionManager.destroySession(GUILD);
+    ctx.librespot.stdout.write(Buffer.alloc(4096));
+    await flush();
+    assert.ok(!logs.error.some((l) => /write after|destroyed/i.test(l)));
   });
 });
 
@@ -157,6 +178,7 @@ describe('soundboard API', () => {
     assert.equal(sessionManager.playClip(clip), false);
     assert.equal(sessionManager.stopClip(), false);
     assert.equal(sessionManager.setSpotifyMuted(true), false);
+    assert.equal(sessionManager.muteSpotifyUntilQuiet(), false);
     await join();
     assert.equal(sessionManager.playClip(clip), true);
     assert.deepEqual(sessionManager.getStatus().clip, { id: 1, name: 'c' });

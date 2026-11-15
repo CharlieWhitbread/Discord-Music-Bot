@@ -5,6 +5,12 @@ npm test              # server: node:test, ~6 s, no network
 npm run test:web      # web: Vitest + Testing Library + jsdom (cd web && npm test)
 npm run test:all      # both
 npm run test:live     # opt-in: one real call to YouTube oEmbed
+npm run test:spotify-live -- spotify:playlist:<id>
+                      # opt-in: real Spotify + the bot's librespot (bot in voice;
+                      # plays music, leaves it paused). Measures how far librespot
+                      # runs ahead of Discord (must be < 1.5 s) and that no stale
+                      # play/pause state is published. Set DATA_DIR to a folder
+                      # with a separately-linked spotify-auth.json.
 ```
 
 Requires Node ≥ 22 (`node:test` mock timers with `Date`, glob arguments to
@@ -19,11 +25,13 @@ They run and report, but don't fail the suite.
 
 | File | Covers |
 |---|---|
-| `mixer.test.js` | 3840-byte frames, silence, backpressure high/low marks, gain ramps, clip events, volume/mute, stall resync, `destroy()` |
-| `sessionManager.test.js` | pipeline wiring, idempotent teardown on every failure path, EPIPE, slash commands |
+| `mixer.test.js` | 3840-byte frames, silence, backpressure high/low marks, gain ramps, clip events, volume/mute, pause mute held until the input is quiet (tail dropped, 8 s give-up), stall resync, `destroy()` |
+| `resampler.test.js` | 44.1 → 48 kHz: exact 160/147 length, chunking-independent output, level and > 75 dB SNR from 100 Hz to 18 kHz, clamping, `reset()` |
+| `sessionManager.test.js` | pipeline wiring (librespot → resampler → mixer, no ffmpeg), backpressure pauses/resumes librespot, idempotent teardown on every failure path, stream errors, slash commands |
+| `pause.test.js` | website pause: quiet mute instead of a fixed timer, failed pause unmutes, resume unmutes, a fresh (not stale) "playing" from elsewhere unmutes |
 | `storage.test.js` | `tags.js`, `db.js` (uniqueness, favourites, token expiry), `clipStore` LRU |
 | `transcode.test.js` | ffprobe validation (incl. HLS SSRF), trim/loudnorm output format, serial queue |
-| `spotify.test.js` | 401/429/5xx retry rules, device re-resolution, now-playing cache, OAuth state, scopes |
+| `spotify.test.js` | 401/429/5xx retry rules, device re-resolution, now-playing cache, stale post-command reads not published (pause/resume/next/shuffle, lagging fake), OAuth state, scopes, logs for external pauses and tracks cut short |
 | `queue.test.js` | handover timing, reconcile, skip/play-now, drop rule, not-in-voice, interleaving |
 | `playlists.test.js` | per-playlist lock, cache/TTL, duplicates, mid-failure, delete while playing |
 | `watch.test.js` | re-anchoring, end timer, ended/duration reports, queue cap, oEmbed errors |
