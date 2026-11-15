@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import * as ws from '../ws';
 import type { YouTubeState } from '../types';
 import { PlayerState, YTPlayer, describePlayerError, loadYouTubeApi, parseVideoId } from '../youtube';
@@ -23,6 +23,22 @@ const SUPPRESS_MS = 1200;
 const GESTURE_TIMEOUT_MS = 3000;
 const SKIP_S = 10;
 const VOLUME_KEY = 'yt_volume';
+const DOUBLE_CLICK_MS = 250;
+const CONTROLS_IDLE_MS = 2500;
+
+/* Safari still only ships the prefixed Fullscreen API on some versions. */
+type FullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => void };
+type FullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => void };
+
+function FullscreenIcon({ exit }: { exit: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+      {exit
+        ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
+        : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+    </svg>
+  );
+}
 
 function fmt(seconds: number): string {
   const s = Math.max(0, Math.floor(seconds));
@@ -72,6 +88,12 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
   const [needsGesture, setNeedsGesture] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [volume, setVolume] = useState(() => Number(localStorage.getItem(VOLUME_KEY) ?? 100));
+  /** 'native' = Fullscreen API; 'pseudo' = fixed full-viewport fallback (iPhone Safari). */
+  const [fullscreen, setFullscreen] = useState<'native' | 'pseudo' | null>(null);
+  const [idle, setIdle] = useState(false);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const idleTimer = useRef<number>();
+  const clickTimer = useRef<number>();
 
   sharedRef.current = shared;
   offsetRef.current = clockOffset;
@@ -177,7 +199,9 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
   /** Turns clicks on the video itself into shared commands. */
   function onStateChange(next: number, player: YTPlayer) {
     const prev = lastState.current;
-    lastState.current = next;
+    // Resuming goes PAUSED → BUFFERING → PLAYING; remembering BUFFERING as
+    // "prev" hid the resume and it was never shared.
+    if (next !== PlayerState.BUFFERING) lastState.current = next;
 
     if (next === PlayerState.PLAYING) {
       setNeedsGesture(false);
@@ -329,6 +353,91 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     apply();
   };
 
+  /* ─── fullscreen: our stage (player + synced controls), never YouTube's ─── */
+  const enterFullscreen = () => {
+    const el = stageRef.current as FullscreenElement | null;
+    if (!el) return;
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => setFullscreen('pseudo'));
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else setFullscreen('pseudo'); // iPhone Safari: no element fullscreen
+  };
+
+  const exitFullscreen = () => {
+    const doc = document as FullscreenDocument;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else if (doc.webkitFullscreenElement) doc.webkitExitFullscreen?.();
+    setFullscreen(null);
+  };
+
+  const toggleFullscreen = () => (fullscreen ? exitFullscreen() : enterFullscreen());
+
+  useEffect(() => {
+    const onChange = () => {
+      const doc = document as FullscreenDocument;
+      const el = document.fullscreenElement ?? doc.webkitFullscreenElement ?? null;
+      setFullscreen((cur) => (el && el === stageRef.current ? 'native' : cur === 'pseudo' ? 'pseudo' : null));
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+
+  /* The pseudo mode has no browser-provided Esc, and the page mustn't scroll under it. */
+  useEffect(() => {
+    if (fullscreen !== 'pseudo') return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setFullscreen(null);
+    };
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = overflow;
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [fullscreen]);
+
+  /* Fullscreen controls fade out after a few idle seconds. */
+  const wake = () => {
+    setIdle(false);
+    window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(() => setIdle(true), CONTROLS_IDLE_MS);
+  };
+
+  useEffect(() => {
+    if (fullscreen) wake();
+    else setIdle(false);
+    return () => window.clearTimeout(idleTimer.current);
+  }, [fullscreen]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => window.clearTimeout(clickTimer.current), []);
+
+  /* The shield over the iframe: YouTube's own UI never sees a click, so
+     every play/pause goes through the shared state. Single click waits a
+     beat so a double click (fullscreen) doesn't pause everyone first. */
+  const onShieldClick = () => {
+    window.clearTimeout(clickTimer.current);
+    clickTimer.current = window.setTimeout(togglePlay, DOUBLE_CLICK_MS);
+  };
+
+  const onShieldDoubleClick = () => {
+    window.clearTimeout(clickTimer.current);
+    toggleFullscreen();
+  };
+
+  const onStageKey = (e: ReactKeyboardEvent) => {
+    if ((e.target as HTMLElement).closest('input, button, form')) return;
+    if (e.key === ' ' || e.key === 'k') {
+      e.preventDefault();
+      togglePlay();
+    } else if (e.key === 'f') {
+      toggleFullscreen();
+    }
+  };
+
   const hasVideo = !!shared?.videoId;
   const shown = scrub ?? current;
   const status = shared ? describeAction(shared) : null;
@@ -355,8 +464,27 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
         )}
       </form>
 
+      <div
+        ref={stageRef}
+        className={`yt-stage${fullscreen ? ' fullscreen' : ''}${fullscreen === 'pseudo' ? ' pseudo' : ''}${fullscreen && idle && playing ? ' idle' : ''}`}
+        tabIndex={-1}
+        onKeyDown={onStageKey}
+        onPointerMove={fullscreen ? wake : undefined}
+        onPointerDown={fullscreen ? wake : undefined}
+      >
       <div className="yt-frame">
         <div ref={containerRef} className="yt-player" />
+        {hasVideo && (
+          <div
+            className={`yt-shield${playing ? '' : ' paused'}`}
+            role="button"
+            aria-label={playing ? 'Pause for everyone' : 'Play for everyone'}
+            onClick={onShieldClick}
+            onDoubleClick={onShieldDoubleClick}
+          >
+            {!playing && <span className="yt-shield-icon" aria-hidden="true">▶</span>}
+          </div>
+        )}
         {!hasVideo && (
           <div className="yt-placeholder">
             <span className="yt-placeholder-icon">📺</span>
@@ -426,9 +554,18 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
             <button className="btn subtle" disabled={!connected} onClick={() => send({ type: 'yt:clear' })}>
               Stop for everyone
             </button>
+            <button
+              className="np-btn yt-fs-btn"
+              onClick={toggleFullscreen}
+              aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              title={fullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen (F)'}
+            >
+              <FullscreenIcon exit={!!fullscreen} />
+            </button>
           </div>
         </div>
       )}
+      </div>
 
       {queue.length > 0 && (
         <section className="panel yt-queue">

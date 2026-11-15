@@ -141,6 +141,101 @@ describe('echo suppression', () => {
     act(() => p.fire(PlayerState.PAUSED));
     expect(sent('yt:pause')).toEqual([]);
   });
+
+  test('a resume that buffers first (PAUSED → BUFFERING → PLAYING) is still shared', async () => {
+    const { p } = await mount(shared({ playing: false, position: 5, action: 'pause' }));
+    act(() => p.fire(PlayerState.PAUSED));
+    tick(1500);
+    p.time = 5;
+    act(() => p.fire(PlayerState.BUFFERING));
+    act(() => p.fire(PlayerState.PLAYING));
+    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: 5 }]);
+  });
+});
+
+describe('shield over the embedded player', () => {
+  const shield = () => screen.getByRole('button', { name: /^(Play|Pause) for everyone$/ });
+  const stage = () => document.querySelector('.yt-stage')!;
+
+  test('YouTube’s iframe never gets clicks; a click on the shield toggles for everyone', async () => {
+    const { p } = await mount(shared());
+    p.time = 8;
+    expect(shield()).toHaveAccessibleName('Pause for everyone');
+    fireEvent.click(shield());
+    expect(sendYoutube).not.toHaveBeenCalled(); // waits to rule out a double click
+    tick(250);
+    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:pause', position: 8 });
+  });
+
+  test('paused: the shield shows our play button', async () => {
+    await mount(shared({ playing: false, action: 'pause' }));
+    expect(shield()).toHaveAccessibleName('Play for everyone');
+    expect(shield()).toHaveClass('paused');
+    fireEvent.click(shield());
+    tick(250);
+    expect(sent('yt:play')).toHaveLength(1);
+  });
+
+  test('a double click goes fullscreen without pausing anyone', async () => {
+    await mount(shared());
+    fireEvent.click(shield());
+    fireEvent.click(shield());
+    fireEvent.doubleClick(shield());
+    tick(500);
+    expect(sendYoutube).not.toHaveBeenCalled();
+    expect(stage()).toHaveClass('fullscreen');
+  });
+
+  test('without the Fullscreen API (iPhone) it falls back to a full-viewport mode; Esc exits', async () => {
+    await mount(shared());
+    fireEvent.click(screen.getByLabelText('Fullscreen'));
+    expect(stage()).toHaveClass('fullscreen', 'pseudo');
+    expect(document.body.style.overflow).toBe('hidden');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(stage()).not.toHaveClass('fullscreen');
+    expect(document.body.style.overflow).toBe('');
+  });
+
+  test('uses the real Fullscreen API on the stage (player + our controls) when available', async () => {
+    const request = vi.fn(function (this: HTMLElement) {
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => this });
+      document.dispatchEvent(new Event('fullscreenchange'));
+      return Promise.resolve();
+    });
+    HTMLElement.prototype.requestFullscreen = request;
+    try {
+      await mount(shared());
+      fireEvent.click(screen.getByLabelText('Fullscreen'));
+      expect(request.mock.contexts[0]).toBe(stage());
+      expect(stage()).toHaveClass('fullscreen');
+      expect(stage()).not.toHaveClass('pseudo');
+      expect(screen.getByLabelText('Exit fullscreen')).toBeInTheDocument();
+
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => null });
+      act(() => { document.dispatchEvent(new Event('fullscreenchange')); }); // user pressed Esc
+      expect(stage()).not.toHaveClass('fullscreen');
+    } finally {
+      delete (HTMLElement.prototype as Partial<HTMLElement>).requestFullscreen;
+      delete (document as Partial<Document> & { fullscreenElement?: unknown }).fullscreenElement;
+    }
+  });
+
+  test('fullscreen controls fade when idle while playing and come back on movement', async () => {
+    await mount(shared());
+    fireEvent.click(screen.getByLabelText('Fullscreen'));
+    tick(2600);
+    expect(stage()).toHaveClass('idle');
+    fireEvent.pointerMove(stage());
+    expect(stage()).not.toHaveClass('idle');
+  });
+
+  test('keyboard: space toggles play, F toggles fullscreen', async () => {
+    await mount(shared());
+    fireEvent.keyDown(shield(), { key: ' ' });
+    expect(sent('yt:pause')).toHaveLength(1);
+    fireEvent.keyDown(shield(), { key: 'f' });
+    expect(stage()).toHaveClass('fullscreen');
+  });
 });
 
 describe('reports to the server', () => {
