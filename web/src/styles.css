@@ -785,79 +785,16 @@ body {
   border-radius: var(--radius);
   overflow: hidden;
 }
-.yt-stage { display: flex; flex-direction: column; gap: 12px; outline: none; }
 .yt-player { position: absolute; inset: 0; }
-/* The iframe is taller than the visible 16:9 frame: YouTube letterboxes the
-   video, and its title bar / logo land in the cropped black bands. It never
-   receives pointer events — the shield above owns every click. */
+/* The iframe fills the 16:9 frame: YouTube's own control bar sits at its
+   bottom edge, so nothing may crop or cover it. */
 .yt-player > * {
   position: absolute;
-  left: 0;
-  top: -60px;
-  width: 100%;
-  height: calc(100% + 120px);
-  border: 0;
-  pointer-events: none;
-}
-.yt-shield {
-  position: absolute;
   inset: 0;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-  touch-action: manipulation;
-}
-/* Paused: cover YouTube's pause-screen suggestions with our own play button. */
-.yt-shield.paused { background: rgba(0, 0, 0, 0.55); }
-.yt-shield-icon {
-  display: grid;
-  place-items: center;
-  width: 72px;
-  height: 72px;
-  padding-left: 6px;
-  border-radius: 50%;
-  background: rgba(20, 20, 28, 0.75);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  font-size: 1.8rem;
-  color: #fff;
-}
-.yt-fs-btn { margin-left: auto; }
-
-/* Fullscreen: our stage (video + synced controls), letterboxed to 16:9. */
-.yt-stage.fullscreen {
-  position: relative;
-  justify-content: center;
-  align-items: center;
-  width: 100vw;
-  height: 100vh;
-  height: 100dvh;
-  gap: 0;
-  background: #000;
-}
-.yt-stage.pseudo { position: fixed; inset: 0; z-index: 1000; }
-.yt-stage.fullscreen .yt-frame {
-  width: min(100vw, calc(100dvh * 16 / 9));
+  width: 100%;
+  height: 100%;
   border: 0;
-  border-radius: 0;
 }
-.yt-stage.fullscreen .yt-controls {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 2;
-  border: 0;
-  border-radius: 0;
-  padding: 24px 20px 16px;
-  background: linear-gradient(transparent, rgba(0, 0, 0, 0.85) 35%);
-  transition: opacity 0.3s;
-}
-.yt-stage.fullscreen.idle { cursor: none; }
-.yt-stage.fullscreen.idle .yt-shield { cursor: none; }
-.yt-stage.fullscreen.idle .yt-controls { opacity: 0; pointer-events: none; }
 .yt-placeholder {
   position: absolute;
   z-index: 2;
@@ -908,10 +845,7 @@ body {
   min-width: 0;
 }
 .yt-status { font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }
-.yt-seek { width: 100%; accent-color: var(--accent); cursor: pointer; }
 .yt-buttons { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.yt-buttons .np-time { margin: 0 8px 0 4px; font-variant-numeric: tabular-nums; }
-.yt-volume { margin-left: auto; }
 .yt-queue { margin-top: 0; }
 .yt-queue .track-results { max-height: none; }
 .yt-thumb {
@@ -924,5 +858,4 @@ body {
 }
 @media (max-width: 560px) {
   .yt-title-row { flex-direction: column; gap: 2px; }
-  .yt-volume { margin-left: 0; }
 }

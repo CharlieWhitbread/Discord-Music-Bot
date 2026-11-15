@@ -10,38 +10,75 @@ const sendYoutube = vi.mocked(ws.sendYoutube);
 
 const V = 'dQw4w9WgXcQ';
 const V2 = 'aaaaaaaaaaa';
+const RATE_NOTICE = 'Playback speed is fixed at 1× so everyone stays in sync';
+
+type Events = {
+  onReady: (e: unknown) => void;
+  onStateChange: (e: unknown) => void;
+  onPlaybackRateChange: (e: unknown) => void;
+  onError: (e: unknown) => void;
+};
 
 /** Stand-in for YT.Player: records calls, lets the test drive state. */
 class FakePlayer {
   static last: FakePlayer;
+  opts: { videoId?: string; playerVars: Record<string, unknown>; events: Events };
   state: number = PlayerState.UNSTARTED;
   videoId: string | undefined;
   duration = 200;
   rate = 1;
+  volume = 100;
+  muted = false;
   time = 0;
-  /** When set, getCurrentTime() is computed (e.g. expected position + drift). */
+  /** When set, getCurrentTime() is computed (e.g. a playing clock). */
   timeFn: (() => number) | null = null;
+  /** When true, seekTo() is recorded but only lands on land() — like a slow iframe. */
+  lagSeeks = false;
+  pendingSeek: { t: number; at: number } | null = null;
   calls: unknown[] = [];
-  events: { onReady: (e: unknown) => void; onStateChange: (e: unknown) => void; onError: (e: unknown) => void };
 
-  constructor(_el: HTMLElement, opts: { videoId?: string; events: FakePlayer['events'] }) {
+  constructor(_el: HTMLElement, opts: FakePlayer['opts']) {
+    this.opts = opts;
     this.videoId = opts.videoId;
-    this.events = opts.events;
     FakePlayer.last = this;
   }
 
+  get events() { return this.opts.events; }
+
   playVideo() { this.calls.push('play'); }
   pauseVideo() { this.calls.push('pause'); }
-  seekTo(t: number) { this.calls.push(['seek', Math.round(t * 10) / 10]); this.time = t; this.timeFn = null; }
-  loadVideoById(o: { videoId: string; startSeconds?: number }) { this.calls.push(['load', o.videoId]); this.videoId = o.videoId; }
-  cueVideoById(o: { videoId: string; startSeconds?: number }) { this.calls.push(['cue', o.videoId]); this.videoId = o.videoId; }
+  seekTo(t: number) {
+    this.calls.push(['seek', Math.round(t * 10) / 10]);
+    if (this.lagSeeks) this.pendingSeek = { t, at: Date.now() };
+    else this.jumpTo(t);
+  }
+  loadVideoById(o: { videoId: string; startSeconds?: number }) {
+    this.calls.push(['load', o.videoId]);
+    this.videoId = o.videoId;
+    this.state = PlayerState.UNSTARTED;
+    this.jumpTo(o.startSeconds ?? 0);
+  }
+  cueVideoById(o: { videoId: string; startSeconds?: number }) {
+    this.calls.push(['cue', o.videoId]);
+    this.videoId = o.videoId;
+    this.state = PlayerState.CUED;
+    this.jumpTo(o.startSeconds ?? 0);
+  }
   getCurrentTime() { return this.timeFn ? this.timeFn() : this.time; }
   getDuration() { return this.duration; }
   getPlayerState() { return this.state; }
   getVideoData() { return { video_id: this.videoId, title: 'Player title' }; }
-  setVolume() {}
-  getVolume() { return 100; }
-  setPlaybackRate(r: number) { this.calls.push(['rate', r]); this.rate = r; }
+  setVolume(v: number) { this.calls.push(['volume', v]); this.volume = v; }
+  getVolume() { return this.volume; }
+  isMuted() { return this.muted; }
+  mute() { this.calls.push('mute'); this.muted = true; }
+  unMute() { this.calls.push('unMute'); this.muted = false; }
+  setPlaybackRate(r: number) {
+    this.calls.push(['rate', r]);
+    this.rate = r;
+    // The real player reports programmatic rate changes too.
+    this.events.onPlaybackRateChange({ data: r, target: this });
+  }
   getPlaybackRate() { return this.rate; }
   destroy() {}
 
@@ -49,6 +86,33 @@ class FakePlayer {
   fire(state: number) {
     this.state = state;
     this.events.onStateChange({ data: state, target: this });
+  }
+  /** Moves the clock to t; it keeps running if the player is playing. */
+  jumpTo(t: number) {
+    if (this.state === PlayerState.PLAYING) {
+      const at = Date.now();
+      this.timeFn = () => t + (Date.now() - at) / 1000;
+    } else {
+      this.timeFn = null;
+      this.time = t;
+    }
+  }
+  /** The late seek finally lands, where it would be by now. */
+  land() {
+    const s = this.pendingSeek!;
+    this.pendingSeek = null;
+    this.jumpTo(s.t + (Date.now() - s.at) / 1000);
+  }
+  /** The user drags YouTube's timeline (or presses an arrow key). */
+  userSeek(t: number) { this.jumpTo(t); }
+  /** The user picks a speed in YouTube's settings menu. */
+  userRate(r: number) {
+    this.rate = r;
+    this.events.onPlaybackRateChange({ data: r, target: this });
+  }
+  freeze() {
+    this.time = this.getCurrentTime();
+    this.timeFn = null;
   }
 }
 
@@ -69,6 +133,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete window.YT;
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -83,7 +148,63 @@ async function mount(state: YouTubeState | null, { connected = true } = {}) {
 }
 
 const sent = (type: string) => sendYoutube.mock.calls.map((c) => c[0]).filter((m) => m.type === type);
+const syncSent = () => sendYoutube.mock.calls.map((c) => c[0]).filter((m) => ['yt:play', 'yt:pause', 'yt:seek'].includes(m.type));
 const tick = (ms: number) => act(() => { vi.advanceTimersByTime(ms); });
+const seeks = (calls: unknown[]) => calls.filter((c) => Array.isArray(c) && c[0] === 'seek');
+
+/**
+ * A playing, in-sync player, 2 s in (just after a once-a-second drift
+ * check), past the suppression window. drift(d) ramps the offset to d over
+ * one second, like real drift — an instant jump would be a seek.
+ */
+async function inSync() {
+  const start = Date.now();
+  const m = await mount(shared({ updatedAt: start }));
+  m.p.state = PlayerState.PLAYING;
+  const expected = () => (Date.now() - start) / 1000;
+  m.p.timeFn = expected;
+  tick(2000);
+  m.p.calls.length = 0;
+  sendYoutube.mockClear();
+  let offset = 0;
+  const drift = (d: number) => {
+    const from = offset;
+    const t0 = Date.now();
+    offset = d;
+    m.p.timeFn = () => expected() + from + (d - from) * Math.min(1, (Date.now() - t0) / 1000);
+  };
+  /** The server echoes a command back as the new anchor. */
+  const echo = (over: Partial<YouTubeState>) => m.update(shared({ updatedAt: Date.now(), ...over }));
+  return { ...m, drift, echo, expected };
+}
+
+describe('native YouTube controls', () => {
+  test('the embed uses YouTube’s controls, keyboard and fullscreen', async () => {
+    const { p } = await mount(shared());
+    expect(p.opts.playerVars).toMatchObject({
+      controls: 1, fs: 1, disablekb: 0, rel: 0, playsinline: 1, iv_load_policy: 3, origin: window.location.origin,
+    });
+  });
+
+  test('nothing covers the iframe while a video is on', async () => {
+    await mount(shared());
+    const frame = document.querySelector('.yt-frame')!;
+    expect(frame.children).toHaveLength(1);
+    expect(frame.firstElementChild).toHaveClass('yt-player');
+  });
+
+  test('our bar keeps only skip, Resync and Stop — no seek, play or volume', async () => {
+    const queue = [{ id: 4, videoId: V2, title: 'Second video', addedBy: null, addedAt: 0 }];
+    await mount(shared({ queue }));
+    expect(screen.queryByRole('slider')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^(Play|Pause|Seek|Back 10 seconds|Forward 10 seconds|Fullscreen)$/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/volume/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Next video')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Resync' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop for everyone' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Up next (1)' })).toBeInTheDocument();
+  });
+});
 
 describe('applying shared state', () => {
   test('on ready, a playing shared video starts locally', async () => {
@@ -106,6 +227,181 @@ describe('applying shared state', () => {
     update(shared({ videoId: null, playing: false }));
     expect(p.calls.at(-1)).toBe('pause');
   });
+
+  test('a suggested video clicked inside the embed is not shared, and the shared one comes back', async () => {
+    const { p } = await inSync();
+    act(() => p.fire(PlayerState.PLAYING));
+    tick(1500);
+    p.calls.length = 0;
+    p.videoId = 'zzzzzzzzzzz';
+    act(() => p.fire(PlayerState.PAUSED));
+    act(() => p.fire(PlayerState.PLAYING));
+    p.userSeek(0);
+    tick(1000);
+    expect(syncSent()).toEqual([]);
+    expect(p.calls).toContainEqual(['load', V]);
+  });
+});
+
+describe('native play/pause', () => {
+  test('pause then resume (PAUSED → BUFFERING → PLAYING) is shared once each', async () => {
+    const { p, echo } = await inSync();
+    act(() => p.fire(PlayerState.PLAYING));
+    tick(1500);
+    p.freeze();
+    act(() => p.fire(PlayerState.PAUSED));
+    const at = p.getCurrentTime();
+    expect(sent('yt:pause')).toEqual([{ type: 'yt:pause', position: at }]);
+
+    tick(1000); // echo not here yet: drift correction must not resume us
+    expect(p.calls).not.toContain('play');
+    echo({ playing: false, position: at, action: 'pause' });
+
+    tick(1500);
+    act(() => p.fire(PlayerState.BUFFERING));
+    act(() => p.fire(PlayerState.PLAYING));
+    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: at }]);
+    echo({ playing: true, position: at, action: 'play' });
+    p.jumpTo(at);
+    tick(3000);
+    expect(sent('yt:pause')).toHaveLength(1);
+    expect(sent('yt:play')).toHaveLength(1);
+    expect(sent('yt:seek')).toEqual([]);
+  });
+
+  test('a background-tab pause (mobile) is not shared', async () => {
+    const { p } = await mount(shared());
+    act(() => p.fire(PlayerState.PLAYING));
+    tick(1500);
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    act(() => p.fire(PlayerState.PAUSED));
+    expect(sent('yt:pause')).toEqual([]);
+  });
+
+  test('replaying from the end screen is shared', async () => {
+    const { p, update } = await mount(shared());
+    act(() => p.fire(PlayerState.ENDED));
+    update(shared({ playing: false, position: 200, action: 'ended' }));
+    tick(1500);
+    p.time = 0;
+    act(() => p.fire(PlayerState.PLAYING));
+    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: 0 }]);
+  });
+});
+
+describe('native seeks', () => {
+  test('a seek while playing is shared once, before drift correction can undo it', async () => {
+    const { p, echo } = await inSync();
+    tick(750); // the next sample is also a drift check
+    p.userSeek(100);
+    tick(250);
+    expect(sent('yt:seek')).toEqual([{ type: 'yt:seek', position: 100.25 }]); // where it is now, not where it landed
+    expect(seeks(p.calls)).toEqual([]);
+
+    tick(250); // still waiting for the echo
+    echo({ position: p.getCurrentTime(), action: 'seek' });
+    tick(5000);
+    expect(sent('yt:seek')).toHaveLength(1);
+    expect(seeks(p.calls)).toEqual([]);
+  });
+
+  test('a backwards seek (e.g. ← key) is shared too', async () => {
+    const { p } = await inSync();
+    tick(3000);
+    p.userSeek(0);
+    tick(250);
+    expect(sent('yt:seek')).toEqual([{ type: 'yt:seek', position: 0.25 }]);
+  });
+
+  test('a seek while paused is shared, and a later resume still is', async () => {
+    const { p, update } = await mount(shared({ playing: false, position: 5, action: 'pause' }));
+    act(() => p.fire(PlayerState.PAUSED));
+    tick(1500);
+    act(() => p.fire(PlayerState.BUFFERING));
+    p.userSeek(60);
+    act(() => p.fire(PlayerState.PAUSED));
+    tick(250);
+    expect(sent('yt:seek')).toEqual([{ type: 'yt:seek', position: 60 }]);
+    update(shared({ playing: false, position: 60, action: 'seek', updatedAt: Date.now() }));
+    expect(seeks(p.calls)).toEqual([['seek', 5]]); // only the initial apply()
+
+    tick(1500);
+    act(() => p.fire(PlayerState.BUFFERING));
+    act(() => p.fire(PlayerState.PLAYING));
+    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: 60 }]);
+    expect(sent('yt:pause')).toEqual([]);
+  });
+
+  test('seeks made by apply() (a remote seek) are not sent', async () => {
+    const { p, echo } = await inSync();
+    echo({ position: 80, action: 'seek' });
+    expect(seeks(p.calls)).toEqual([['seek', 80]]);
+    tick(5000);
+    expect(syncSent()).toEqual([]);
+  });
+
+  test('drift-correction hard seeks are not sent', async () => {
+    const { p } = await inSync();
+    p.freeze(); // decoder stall while "playing"
+    tick(2000);
+    expect(p.calls).toEqual([['rate', 1.05], ['seek', 4]]);
+    tick(5000);
+    expect(syncSent()).toEqual([]);
+  });
+
+  test('our own seek landing after the suppression window is not mistaken for the user', async () => {
+    const { p } = await inSync();
+    p.lagSeeks = true;
+    p.freeze();
+    tick(2000);
+    expect(seeks(p.calls)).toEqual([['seek', 4]]);
+    tick(1250); // well past the 1.2 s window
+    p.land();
+    tick(250);
+    expect(syncSent()).toEqual([]);
+  });
+
+  test('a buffering stall (time standing still) is not a seek', async () => {
+    const { p } = await inSync();
+    p.freeze();
+    p.state = PlayerState.BUFFERING;
+    tick(4000);
+    p.state = PlayerState.PLAYING;
+    tick(3000);
+    expect(seeks(p.calls).length).toBeGreaterThan(0); // drift caught us up
+    expect(syncSent()).toEqual([]);
+  });
+
+  test('a freshly loaded or cued video jumping to its start is not a seek', async () => {
+    const { p, echo } = await inSync();
+    echo({ videoId: V2, position: 0, action: 'load' });
+    expect(p.calls).toContainEqual(['load', V2]);
+    tick(1500);
+    p.state = PlayerState.BUFFERING;
+    tick(500);
+    p.time = 30; // e.g. YouTube resuming where this viewer left off
+    tick(500);
+    p.state = PlayerState.PLAYING;
+    tick(500);
+
+    echo({ videoId: V, playing: false, position: 42, action: 'load' });
+    expect(p.calls).toContainEqual(['cue', V]);
+    tick(1500);
+    p.time = 0;
+    tick(1000);
+    expect(syncSent()).toEqual([]);
+  });
+
+  test('an ad (its own duration and clock) is not a seek', async () => {
+    const { p } = await inSync();
+    p.duration = 15;
+    p.userSeek(0);
+    tick(1000);
+    p.duration = 200;
+    p.userSeek(5);
+    tick(250);
+    expect(sent('yt:seek')).toEqual([]);
+  });
 });
 
 describe('echo suppression', () => {
@@ -119,122 +415,82 @@ describe('echo suppression', () => {
     expect(sendYoutube).not.toHaveBeenCalled();
   });
 
-  test('a real click on the video (outside the window) is shared', async () => {
-    const { p, update } = await mount(shared());
+  test('remote pause, play and seek never bounce back', async () => {
+    const { p, echo } = await inSync();
     act(() => p.fire(PlayerState.PLAYING));
     tick(1500);
-    p.time = 12.3;
-    act(() => p.fire(PlayerState.PAUSED));
-    expect(sent('yt:pause')).toEqual([{ type: 'yt:pause', position: 12.3 }]);
+    sendYoutube.mockClear();
 
-    update(shared({ playing: false, position: 12.3, action: 'pause' }));
-    tick(1500);
-    act(() => p.fire(PlayerState.PLAYING));
-    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: 12.3 }]);
-  });
-
-  test('a background-tab pause (mobile) is not shared', async () => {
-    const { p } = await mount(shared());
-    act(() => p.fire(PlayerState.PLAYING));
-    tick(1500);
-    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    echo({ playing: false, position: p.getCurrentTime(), action: 'pause' });
+    p.freeze();
     act(() => p.fire(PlayerState.PAUSED));
-    expect(sent('yt:pause')).toEqual([]);
-  });
-
-  test('a resume that buffers first (PAUSED → BUFFERING → PLAYING) is still shared', async () => {
-    const { p } = await mount(shared({ playing: false, position: 5, action: 'pause' }));
-    act(() => p.fire(PlayerState.PAUSED));
-    tick(1500);
-    p.time = 5;
+    tick(1000);
+    echo({ playing: true, position: p.getCurrentTime(), action: 'play' });
     act(() => p.fire(PlayerState.BUFFERING));
     act(() => p.fire(PlayerState.PLAYING));
-    expect(sent('yt:play')).toEqual([{ type: 'yt:play', position: 5 }]);
+    p.jumpTo(p.getCurrentTime());
+    tick(1000);
+    echo({ position: 120, action: 'seek' });
+    act(() => p.fire(PlayerState.BUFFERING));
+    act(() => p.fire(PlayerState.PLAYING));
+    tick(5000);
+
+    expect(p.calls).toEqual(expect.arrayContaining(['pause', 'play', ['seek', 120]]));
+    expect(syncSent()).toEqual([]);
   });
 });
 
-describe('shield over the embedded player', () => {
-  const shield = () => screen.getByRole('button', { name: /^(Play|Pause) for everyone$/ });
-  const stage = () => document.querySelector('.yt-stage')!;
+describe('playback speed', () => {
+  test('a speed picked by the user is reset to 1× with a notice', async () => {
+    const { p } = await inSync();
+    act(() => p.userRate(2));
+    expect(p.calls).toEqual([['rate', 1]]);
+    expect(p.rate).toBe(1);
+    expect(notify).toHaveBeenCalledWith(RATE_NOTICE);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
 
-  test('YouTube’s iframe never gets clicks; a click on the shield toggles for everyone', async () => {
+  test('our own 0.95/1.05 nudges never trigger the notice', async () => {
+    const { p, drift } = await inSync();
+    drift(1.4);
+    tick(1000);
+    drift(-0.6);
+    tick(1000);
+    drift(0);
+    tick(1000);
+    expect(p.calls).toEqual([['rate', 0.95], ['rate', 1.05], ['rate', 1]]);
+    expect(notify).not.toHaveBeenCalled();
+  });
+});
+
+describe('per-person volume', () => {
+  test('saved volume and mute are restored on ready', async () => {
+    localStorage.setItem('yt_volume', '30');
+    localStorage.setItem('yt_muted', '1');
     const { p } = await mount(shared());
-    p.time = 8;
-    expect(shield()).toHaveAccessibleName('Pause for everyone');
-    fireEvent.click(shield());
-    expect(sendYoutube).not.toHaveBeenCalled(); // waits to rule out a double click
+    expect(p.volume).toBe(30);
+    expect(p.muted).toBe(true);
+  });
+
+  test('defaults to full volume, unmuted', async () => {
+    const { p } = await mount(shared());
+    expect(p.calls).toContainEqual(['volume', 100]);
+    expect(p.calls).not.toContain('mute');
+  });
+
+  test('changes made in YouTube’s controls are saved, and only on change', async () => {
+    localStorage.setItem('yt_volume', '30');
+    const { p } = await mount(shared());
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    tick(3000);
+    expect(setItem).not.toHaveBeenCalled();
+    p.volume = 55;
     tick(250);
-    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:pause', position: 8 });
-  });
-
-  test('paused: the shield shows our play button', async () => {
-    await mount(shared({ playing: false, action: 'pause' }));
-    expect(shield()).toHaveAccessibleName('Play for everyone');
-    expect(shield()).toHaveClass('paused');
-    fireEvent.click(shield());
-    tick(250);
-    expect(sent('yt:play')).toHaveLength(1);
-  });
-
-  test('a double click goes fullscreen without pausing anyone', async () => {
-    await mount(shared());
-    fireEvent.click(shield());
-    fireEvent.click(shield());
-    fireEvent.doubleClick(shield());
-    tick(500);
-    expect(sendYoutube).not.toHaveBeenCalled();
-    expect(stage()).toHaveClass('fullscreen');
-  });
-
-  test('without the Fullscreen API (iPhone) it falls back to a full-viewport mode; Esc exits', async () => {
-    await mount(shared());
-    fireEvent.click(screen.getByLabelText('Fullscreen'));
-    expect(stage()).toHaveClass('fullscreen', 'pseudo');
-    expect(document.body.style.overflow).toBe('hidden');
-    fireEvent.keyDown(document, { key: 'Escape' });
-    expect(stage()).not.toHaveClass('fullscreen');
-    expect(document.body.style.overflow).toBe('');
-  });
-
-  test('uses the real Fullscreen API on the stage (player + our controls) when available', async () => {
-    const request = vi.fn(function (this: HTMLElement) {
-      Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => this });
-      document.dispatchEvent(new Event('fullscreenchange'));
-      return Promise.resolve();
-    });
-    HTMLElement.prototype.requestFullscreen = request;
-    try {
-      await mount(shared());
-      fireEvent.click(screen.getByLabelText('Fullscreen'));
-      expect(request.mock.contexts[0]).toBe(stage());
-      expect(stage()).toHaveClass('fullscreen');
-      expect(stage()).not.toHaveClass('pseudo');
-      expect(screen.getByLabelText('Exit fullscreen')).toBeInTheDocument();
-
-      Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => null });
-      act(() => { document.dispatchEvent(new Event('fullscreenchange')); }); // user pressed Esc
-      expect(stage()).not.toHaveClass('fullscreen');
-    } finally {
-      delete (HTMLElement.prototype as Partial<HTMLElement>).requestFullscreen;
-      delete (document as Partial<Document> & { fullscreenElement?: unknown }).fullscreenElement;
-    }
-  });
-
-  test('fullscreen controls fade when idle while playing and come back on movement', async () => {
-    await mount(shared());
-    fireEvent.click(screen.getByLabelText('Fullscreen'));
-    tick(2600);
-    expect(stage()).toHaveClass('idle');
-    fireEvent.pointerMove(stage());
-    expect(stage()).not.toHaveClass('idle');
-  });
-
-  test('keyboard: space toggles play, F toggles fullscreen', async () => {
-    await mount(shared());
-    fireEvent.keyDown(shield(), { key: ' ' });
-    expect(sent('yt:pause')).toHaveLength(1);
-    fireEvent.keyDown(shield(), { key: 'f' });
-    expect(stage()).toHaveClass('fullscreen');
+    expect(localStorage.getItem('yt_volume')).toBe('55');
+    p.muted = true;
+    tick(1000);
+    expect(localStorage.getItem('yt_muted')).toBe('1');
+    expect(setItem).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -276,22 +532,13 @@ describe('reports to the server', () => {
 });
 
 describe('drift correction', () => {
-  async function inSync() {
-    const start = Date.now();
-    const m = await mount(shared({ updatedAt: start }));
-    m.p.state = PlayerState.PLAYING;
-    const expected = () => (Date.now() - start) / 1000;
-    m.p.timeFn = expected;
-    tick(2000); // past the suppression window, in sync
-    m.p.calls.length = 0;
-    return { ...m, drift: (d: number) => { m.p.timeFn = () => expected() + d; } };
-  }
-
   test('> 1.5 s off: hard seek to the shared position', async () => {
-    const { p, drift } = await inSync();
-    drift(2);
+    const { p } = await inSync();
+    p.freeze(); // stalls at 2 s while the shared clock runs on
     tick(1000);
-    expect(p.calls).toEqual([['seek', 3]]);
+    expect(p.calls).toEqual([['rate', 1.05]]); // 1 s behind: nudge
+    tick(1000);
+    expect(p.calls).toEqual([['rate', 1.05], ['seek', 4]]);
   });
 
   test('0.3–1.5 s ahead/behind: nudge the playback rate, no seek', async () => {
@@ -314,11 +561,21 @@ describe('drift correction', () => {
   });
 
   test('no correction once the shared timeline is past the end', async () => {
-    const { p, drift } = await inSync();
+    const { p } = await inSync();
     p.duration = 1;
-    drift(5);
-    tick(1000);
+    p.freeze();
+    tick(3000);
     expect(p.calls).toEqual([]);
+  });
+
+  test('a seek nobody echoes (socket down) is reported, then undone', async () => {
+    const { p } = await inSync();
+    sendYoutube.mockReturnValue(false);
+    p.userSeek(100);
+    tick(250);
+    expect(notify).toHaveBeenCalledWith('Not connected to the bot — can’t sync');
+    tick(3000);
+    expect(seeks(p.calls)).toHaveLength(1);
   });
 });
 
@@ -328,6 +585,7 @@ describe('blocked autoplay', () => {
     p.state = PlayerState.CUED; // the browser refused to autoplay
     tick(6000);
     const join = screen.getByRole('button', { name: /join the watch party/ });
+    expect(join.closest('.yt-frame')).not.toBeNull(); // sits over the video
     p.calls.length = 0;
     fireEvent.click(join);
     expect(p.calls[0]).toBe('play');
@@ -362,8 +620,17 @@ describe('queue and controls UI', () => {
   test('skip is disabled with an empty queue; everything is disabled offline', async () => {
     await mount(shared(), { connected: false });
     expect(screen.getByLabelText('Next video')).toBeDisabled();
-    expect(screen.getByLabelText('Pause')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Stop for everyone' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '+ Queue' })).toBeDisabled();
+  });
+
+  test('"Stop for everyone" clears; Resync snaps to the shared position', async () => {
+    const { p } = await inSync();
+    fireEvent.click(screen.getByRole('button', { name: 'Stop for everyone' }));
+    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:clear' });
+    p.userSeek(50);
+    fireEvent.click(screen.getByRole('button', { name: 'Resync' }));
+    expect(seeks(p.calls)).toEqual([['seek', 2]]);
   });
 
   test('pasting a link queues it; "Play now" loads it; junk is refused', async () => {
@@ -388,26 +655,13 @@ describe('queue and controls UI', () => {
   test('a dropped socket is reported instead of silently ignored', async () => {
     sendYoutube.mockReturnValue(false);
     await mount(shared());
-    fireEvent.click(screen.getByLabelText('Pause'));
+    fireEvent.click(screen.getByRole('button', { name: 'Stop for everyone' }));
     expect(notify).toHaveBeenCalledWith('Not connected to the bot — can’t sync');
-  });
-
-  test('transport buttons send the local position; skips are clamped', async () => {
-    const { p } = await mount(shared());
-    p.time = 4;
-    fireEvent.click(screen.getByLabelText('Pause'));
-    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:pause', position: 4 });
-    fireEvent.click(screen.getByLabelText('Back 10 seconds'));
-    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:seek', position: 0 });
-    tick(1000); // UI learns the duration (200 s)
-    p.time = 195;
-    fireEvent.click(screen.getByLabelText('Forward 10 seconds'));
-    expect(sendYoutube).toHaveBeenLastCalledWith({ type: 'yt:seek', position: 199.5 });
   });
 
   test('nothing on: placeholder, no controls', async () => {
     await mount(null);
     expect(screen.getByText(/Nothing on yet/)).toBeInTheDocument();
-    expect(screen.queryByLabelText('Pause')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Next video')).not.toBeInTheDocument();
   });
 });

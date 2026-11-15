@@ -24,6 +24,9 @@ export interface YTPlayer {
   getVideoData(): { video_id?: string; title?: string; author?: string };
   setVolume(volume: number): void;
   getVolume(): number;
+  isMuted(): boolean;
+  mute(): void;
+  unMute(): void;
   setPlaybackRate(rate: number): void;
   getPlaybackRate(): number;
   destroy(): void;
@@ -38,6 +41,7 @@ interface YTNamespace {
       events?: {
         onReady?: (e: { target: YTPlayer }) => void;
         onStateChange?: (e: { data: number; target: YTPlayer }) => void;
+        onPlaybackRateChange?: (e: { data: number; target: YTPlayer }) => void;
         onError?: (e: { data: number }) => void;
       };
     },

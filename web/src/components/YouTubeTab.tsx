@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import * as ws from '../ws';
 import type { YouTubeState } from '../types';
 import { PlayerState, YTPlayer, describePlayerError, loadYouTubeApi, parseVideoId } from '../youtube';
@@ -14,30 +14,43 @@ interface Props {
    jump; large drift (buffering, late join, tab throttling) hard-seeks. */
 const HARD_SEEK_S = 1.5;
 const NUDGE_S = 0.3;
-const DRIFT_CHECK_MS = 1000;
+/* YouTube fires no seek event, so the player is sampled this often to spot
+   native timeline/keyboard seeks. Drift is still only corrected once a
+   second — always after the seek check, so a fresh user seek is shared
+   instead of being yanked back to the old shared position. */
+const SAMPLE_MS = 250;
+const DRIFT_EVERY = 4;
+/* A jump bigger than this between two samples (beyond what playback could
+   explain) is a seek. */
+const SEEK_JUMP_S = 1;
 /* Programmatic player calls fire onStateChange too — ignore events for this
    long after we act, or every client would echo every command back. */
 const SUPPRESS_MS = 1200;
+/* Our own seek can land late (the iframe reports time asynchronously); a
+   jump onto a recent target of ours is never a user seek. */
+const OWN_SEEK_MS = 5000;
+/* After sharing a local pause/play/seek, don't drift-correct until the
+   server's echo has had time to arrive — otherwise we'd undo the user. */
+const AWAIT_ECHO_MS = 2000;
 /* If we should be playing but aren't for this long, the browser probably
    blocked autoplay — ask for a click. */
 const GESTURE_TIMEOUT_MS = 3000;
-const SKIP_S = 10;
 const VOLUME_KEY = 'yt_volume';
-const DOUBLE_CLICK_MS = 250;
-const CONTROLS_IDLE_MS = 2500;
+const MUTED_KEY = 'yt_muted';
+/* getVolume()/isMuted() are cached from iframe messages and lag behind our
+   restore on ready; don't persist until they've caught up. */
+const VOLUME_SETTLE_MS = 2000;
+const RATE_NOTICE = 'Playback speed is fixed at 1× so everyone stays in sync';
 
-/* Safari still only ships the prefixed Fullscreen API on some versions. */
-type FullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => void };
-type FullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => void };
+/** States in which getCurrentTime() is the real timeline of the shared video. */
+const TRACKED_STATES: number[] = [PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.BUFFERING];
 
-function FullscreenIcon({ exit }: { exit: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
-      {exit
-        ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
-        : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
-    </svg>
-  );
+interface Sample {
+  time: number;
+  at: number;
+  state: number;
+  videoId: string | undefined;
+  duration: number;
 }
 
 function fmt(seconds: number): string {
@@ -68,35 +81,43 @@ function thumbnail(videoId: string): string {
   return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 }
 
+function savedVolume(): number {
+  const v = Number(localStorage.getItem(VOLUME_KEY) ?? 100);
+  return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 100;
+}
+
 export default function YouTubeTab({ shared, clockOffset, connected, onNotify }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<YTPlayer | null>(null);
   const readyRef = useRef(false);
   const sharedRef = useRef<YouTubeState | null>(shared);
   const offsetRef = useRef(clockOffset);
+  const notifyRef = useRef(onNotify);
   const suppressUntil = useRef(0);
+  const awaitEchoUntil = useRef(0);
   const lastState = useRef<number>(PlayerState.UNSTARTED);
   const notPlayingSince = useRef<number | null>(null);
   /** videoId whose duration we've already reported to the server */
   const reportedDuration = useRef<string | null>(null);
+  /* Seek detection */
+  const sample = useRef<Sample | null>(null);
+  const ownSeek = useRef<{ target: number; at: number } | null>(null);
+  /** Video that has reached PLAYING/PAUSED since it was loaded — before that its clock jumps freely. */
+  const settledVideo = useRef<string | null>(null);
+  /** Last rate we set ourselves, so our drift nudges aren't mistaken for the user's. */
+  const lastRate = useRef(1);
+  /* Per-person volume */
+  const lastVolume = useRef<{ volume: number; muted: boolean } | null>(null);
+  const volumeSettleUntil = useRef(0);
 
   const [input, setInput] = useState('');
   const [title, setTitle] = useState<string | null>(null);
-  const [current, setCurrent] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [scrub, setScrub] = useState<number | null>(null);
   const [needsGesture, setNeedsGesture] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
-  const [volume, setVolume] = useState(() => Number(localStorage.getItem(VOLUME_KEY) ?? 100));
-  /** 'native' = Fullscreen API; 'pseudo' = fixed full-viewport fallback (iPhone Safari). */
-  const [fullscreen, setFullscreen] = useState<'native' | 'pseudo' | null>(null);
-  const [idle, setIdle] = useState(false);
-  const stageRef = useRef<HTMLDivElement>(null);
-  const idleTimer = useRef<number>();
-  const clickTimer = useRef<number>();
 
   sharedRef.current = shared;
   offsetRef.current = clockOffset;
+  notifyRef.current = onNotify;
 
   /** Where the shared timeline is right now, in seconds. */
   const expectedPosition = useCallback((): number => {
@@ -108,6 +129,28 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
   }, []);
 
   const suppress = () => { suppressUntil.current = Date.now() + SUPPRESS_MS; };
+
+  /** Every programmatic seek goes through here so the seek detector knows it was us. */
+  const seekPlayer = (player: YTPlayer, target: number) => {
+    suppress();
+    ownSeek.current = { target, at: Date.now() };
+    player.seekTo(target, true);
+  };
+
+  const setRate = (player: YTPlayer, rate: number) => {
+    if (player.getPlaybackRate() === rate) return;
+    // Rate changes fire no state events, only onPlaybackRateChange — which
+    // lastRate covers. A suppress() window here would blind pause/seek
+    // sharing for 1.2 s after every nudge.
+    lastRate.current = rate;
+    player.setPlaybackRate(rate);
+  };
+
+  /** Shares a change the user made with the native controls. */
+  const share = (command: ws.YouTubeCommand) => {
+    awaitEchoUntil.current = Date.now() + AWAIT_ECHO_MS;
+    if (!ws.sendYoutube(command)) notifyRef.current('Not connected to the bot — can’t sync');
+  };
 
   /** Bring the local player in line with the shared state. */
   const apply = useCallback(() => {
@@ -127,6 +170,7 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     const target = expectedPosition();
     if (player.getVideoData().video_id !== s.videoId) {
       suppress();
+      ownSeek.current = { target, at: Date.now() };
       if (s.playing) player.loadVideoById({ videoId: s.videoId, startSeconds: target });
       else player.cueVideoById({ videoId: s.videoId, startSeconds: target });
       return;
@@ -135,8 +179,7 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     const st = player.getPlayerState();
     const localPlaying = st === PlayerState.PLAYING || st === PlayerState.BUFFERING;
     if (Math.abs(player.getCurrentTime() - target) > (s.playing ? HARD_SEEK_S : 0.5)) {
-      suppress();
-      player.seekTo(target, true);
+      seekPlayer(player, target);
     }
     if (s.playing && !localPlaying) {
       suppress();
@@ -145,6 +188,7 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
       suppress();
       player.pauseVideo();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expectedPosition]);
 
   /* ─── player lifecycle ─── */
@@ -164,9 +208,12 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
           // An explicit undefined videoId throws "Invalid video id".
           ...(initial?.videoId ? { videoId: initial.videoId } : {}),
           playerVars: {
-            // Custom controls only: native seek/keyboard would bypass sync.
-            controls: 0,
-            disablekb: 1,
+            // YouTube's own controls and shortcuts: play/pause and seeks are
+            // detected and shared; quality, captions, volume and fullscreen
+            // are per person.
+            controls: 1,
+            fs: 1,
+            disablekb: 0,
             rel: 0,
             playsinline: 1,
             iv_load_policy: 3,
@@ -175,11 +222,12 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
           events: {
             onReady: (e) => {
               readyRef.current = true;
-              e.target.setVolume(volume);
+              restoreVolume(e.target);
               apply();
             },
             onStateChange: (e) => onStateChange(e.data, e.target),
-            onError: (e) => onNotify(describePlayerError(e.data)),
+            onPlaybackRateChange: (e) => onPlaybackRateChange(e.data, e.target),
+            onError: (e) => notifyRef.current(describePlayerError(e.data)),
           },
         });
       })
@@ -196,23 +244,49 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Turns clicks on the video itself into shared commands. */
+  function restoreVolume(player: YTPlayer) {
+    const volume = savedVolume();
+    const muted = localStorage.getItem(MUTED_KEY) === '1';
+    player.setVolume(volume);
+    if (muted) player.mute();
+    lastVolume.current = { volume, muted };
+    volumeSettleUntil.current = Date.now() + VOLUME_SETTLE_MS;
+  }
+
+  /** Volume is per person: remember whatever they set in YouTube's own controls. */
+  function persistVolume(player: YTPlayer) {
+    if (Date.now() < volumeSettleUntil.current || !lastVolume.current) return;
+    const volume = player.getVolume();
+    const muted = player.isMuted();
+    if (typeof volume === 'number' && volume !== lastVolume.current.volume) {
+      localStorage.setItem(VOLUME_KEY, String(volume));
+      lastVolume.current.volume = volume;
+    }
+    if (typeof muted === 'boolean' && muted !== lastVolume.current.muted) {
+      localStorage.setItem(MUTED_KEY, muted ? '1' : '0');
+      lastVolume.current.muted = muted;
+    }
+  }
+
+  /* Drift correction steers the playback rate, so a user-chosen speed would
+     both desync them and fight the nudges — pin it to 1×. */
+  function onPlaybackRateChange(rate: number, player: YTPlayer) {
+    if (rate === 1 || rate === lastRate.current) return;
+    lastRate.current = 1;
+    suppress();
+    player.setPlaybackRate(1);
+    notifyRef.current(RATE_NOTICE);
+  }
+
+  /** Turns native play/pause (click, tap, keyboard) into shared commands. */
   function onStateChange(next: number, player: YTPlayer) {
     const prev = lastState.current;
     // Resuming goes PAUSED → BUFFERING → PLAYING; remembering BUFFERING as
     // "prev" hid the resume and it was never shared.
     if (next !== PlayerState.BUFFERING) lastState.current = next;
 
-    if (next === PlayerState.PLAYING) {
-      setNeedsGesture(false);
-      const data = player.getVideoData();
-      setTitle(data.title || null);
-      setDuration(player.getDuration() || 0);
-    }
-    if (next === PlayerState.CUED) {
-      setDuration(player.getDuration() || 0);
-      setTitle(player.getVideoData().title || null);
-    }
+    if (next === PlayerState.PLAYING) setNeedsGesture(false);
+    if (next === PlayerState.PLAYING || next === PlayerState.CUED) setTitle(player.getVideoData().title || null);
 
     // Report the end even during suppression — the server keeps only the
     // first report for the current video and advances the queue.
@@ -223,25 +297,72 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
 
     if (Date.now() < suppressUntil.current) return;
     const s = sharedRef.current;
-    if (!s?.videoId) return;
+    // A suggested video clicked inside the embed isn't the shared one.
+    if (!s?.videoId || player.getVideoData().video_id !== s.videoId) return;
 
     // Mobile browsers pause media when backgrounded — don't pause everyone.
     if (next === PlayerState.PAUSED && prev === PlayerState.PLAYING && s.playing && !document.hidden) {
-      ws.sendYoutube({ type: 'yt:pause', position: player.getCurrentTime() });
+      share({ type: 'yt:pause', position: player.getCurrentTime() });
     } else if (
       next === PlayerState.PLAYING &&
       !s.playing &&
-      (prev === PlayerState.PAUSED || prev === PlayerState.CUED)
+      (prev === PlayerState.PAUSED || prev === PlayerState.CUED || prev === PlayerState.ENDED)
     ) {
-      ws.sendYoutube({ type: 'yt:play', position: player.getCurrentTime() });
+      share({ type: 'yt:play', position: player.getCurrentTime() });
     }
+  }
+
+  /**
+   * Samples the player and returns the new position if it jumped in a way
+   * playback can't explain — i.e. the user seeked with YouTube's timeline or
+   * keyboard. Always re-baselines, so every comparison is between two
+   * consecutive samples.
+   */
+  function detectUserSeek(player: YTPlayer, s: YouTubeState | null): number | null {
+    const now = Date.now();
+    const prev = sample.current;
+    const next: Sample = {
+      time: player.getCurrentTime() || 0,
+      at: now,
+      state: player.getPlayerState(),
+      videoId: player.getVideoData().video_id,
+      duration: player.getDuration() || 0,
+    };
+    sample.current = next;
+    // Judge against what was settled *before* this sample: a fresh load
+    // jumps to its start position on its way to PLAYING.
+    const settled = !!next.videoId && settledVideo.current === next.videoId;
+    if (next.state === PlayerState.PLAYING || next.state === PlayerState.PAUSED) {
+      settledVideo.current = next.videoId ?? null;
+    }
+
+    if (
+      !prev || !settled || document.hidden || now < suppressUntil.current ||
+      !s?.videoId || next.videoId !== s.videoId || prev.videoId !== next.videoId ||
+      // An ad reports its own duration and clock — never a user seek.
+      prev.duration !== next.duration ||
+      !TRACKED_STATES.includes(prev.state) || !TRACKED_STATES.includes(next.state)
+    ) return null;
+
+    // While playing (or buffering, which may resume mid-interval) time may
+    // advance by anything from 0 (stall) to elapsed × rate; paused, not at all.
+    const moving = [prev.state, next.state].some((st) => st === PlayerState.PLAYING || st === PlayerState.BUFFERING);
+    const elapsed = (now - prev.at) / 1000;
+    const maxAdvance = moving ? elapsed * Math.max(1, player.getPlaybackRate() || 1) : 0;
+    if (next.time >= prev.time - SEEK_JUMP_S && next.time <= prev.time + maxAdvance + SEEK_JUMP_S) return null;
+
+    const own = ownSeek.current;
+    if (own && now - own.at < OWN_SEEK_MS) {
+      const ran = moving ? ((now - own.at) / 1000) * 1.05 : 0;
+      if (next.time >= own.target - SEEK_JUMP_S && next.time <= own.target + ran + SEEK_JUMP_S) return null;
+    }
+    return next.time;
   }
 
   /* Re-sync whenever the shared state (or clock estimate) changes. */
   useEffect(() => {
     if (!shared?.videoId) {
       setTitle(null);
-      setDuration(0);
       setNeedsGesture(false);
     }
     // Every (re)start resets the server's duration — report it again, even
@@ -252,16 +373,28 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     apply();
   }, [shared, clockOffset, apply]);
 
-  /* ─── drift correction + UI clock ─── */
+  /* ─── seek detection, volume, reports, drift correction ─── */
   useEffect(() => {
+    let samples = 0;
     const timer = window.setInterval(() => {
       const player = playerRef.current;
       const s = sharedRef.current;
       if (!player || !readyRef.current) return;
 
-      setCurrent(player.getCurrentTime() || 0);
+      persistVolume(player);
+      const driftTick = ++samples % DRIFT_EVERY === 0;
+
+      // Must run before drift correction: drift would otherwise hard-seek
+      // the user back to the old shared position before their seek is shared.
+      const seekedTo = detectUserSeek(player, s);
+      if (seekedTo !== null) {
+        share({ type: 'yt:seek', position: seekedTo });
+        return;
+      }
+
+      if (!driftTick) return;
+
       const d = player.getDuration();
-      if (d) setDuration(d);
       if (s?.videoId) setTitle(player.getVideoData().title || null);
       // Tell the server the duration once, so it can advance the queue even
       // when nobody has this tab open at the moment the video ends.
@@ -273,8 +406,16 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
         ws.sendYoutube({ type: 'yt:meta', videoId: s.videoId, duration: d });
       }
 
-      if (!s?.videoId || Date.now() < suppressUntil.current) return;
+      const now = Date.now();
+      if (!s?.videoId || now < suppressUntil.current || now < awaitEchoUntil.current) return;
       const st = player.getPlayerState();
+
+      // Someone clicked a suggested video in the embed — bring them back.
+      const showing = player.getVideoData().video_id;
+      if (showing && showing !== s.videoId) {
+        apply();
+        return;
+      }
 
       if (!s.playing) {
         notPlayingSince.current = null;
@@ -288,27 +429,26 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
           notPlayingSince.current = null;
           return;
         }
-        notPlayingSince.current ??= Date.now();
-        if (Date.now() - notPlayingSince.current > GESTURE_TIMEOUT_MS) setNeedsGesture(true);
+        notPlayingSince.current ??= now;
+        if (now - notPlayingSince.current > GESTURE_TIMEOUT_MS) setNeedsGesture(true);
         else apply();
         return;
       }
       notPlayingSince.current = null;
 
       const target = expectedPosition();
-      const dur = player.getDuration();
-      if (dur && target >= dur) return; // shared timeline ran past the end
+      if (d && target >= d) return; // shared timeline ran past the end
       const drift = player.getCurrentTime() - target;
       if (Math.abs(drift) > HARD_SEEK_S) {
-        suppress();
-        player.seekTo(target, true);
+        seekPlayer(player, target);
       } else if (Math.abs(drift) > NUDGE_S) {
         setRate(player, drift > 0 ? 0.95 : 1.05);
       } else {
         setRate(player, 1);
       }
-    }, DRIFT_CHECK_MS);
+    }, SAMPLE_MS);
     return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apply, expectedPosition]);
 
   /* ─── user actions ─── */
@@ -329,117 +469,15 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
     setInput('');
   };
 
-  const position = () => playerRef.current?.getCurrentTime() ?? expectedPosition();
-  const playing = !!shared?.playing;
-  const togglePlay = () => send({ type: playing ? 'yt:pause' : 'yt:play', position: position() });
-  const seekTo = (s: number) =>
-    send({ type: 'yt:seek', position: Math.max(0, duration ? Math.min(s, duration - 0.5) : s) });
-
-  const commitScrub = () => {
-    if (scrub !== null) seekTo(scrub);
-    setScrub(null);
-  };
-
-  const changeVolume = (v: number) => {
-    setVolume(v);
-    localStorage.setItem(VOLUME_KEY, String(v));
-    playerRef.current?.setVolume(v);
-  };
-
   const join = () => {
     setNeedsGesture(false);
     notPlayingSince.current = null;
+    suppress();
     playerRef.current?.playVideo();
     apply();
   };
 
-  /* ─── fullscreen: our stage (player + synced controls), never YouTube's ─── */
-  const enterFullscreen = () => {
-    const el = stageRef.current as FullscreenElement | null;
-    if (!el) return;
-    if (el.requestFullscreen) el.requestFullscreen().catch(() => setFullscreen('pseudo'));
-    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-    else setFullscreen('pseudo'); // iPhone Safari: no element fullscreen
-  };
-
-  const exitFullscreen = () => {
-    const doc = document as FullscreenDocument;
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-    else if (doc.webkitFullscreenElement) doc.webkitExitFullscreen?.();
-    setFullscreen(null);
-  };
-
-  const toggleFullscreen = () => (fullscreen ? exitFullscreen() : enterFullscreen());
-
-  useEffect(() => {
-    const onChange = () => {
-      const doc = document as FullscreenDocument;
-      const el = document.fullscreenElement ?? doc.webkitFullscreenElement ?? null;
-      setFullscreen((cur) => (el && el === stageRef.current ? 'native' : cur === 'pseudo' ? 'pseudo' : null));
-    };
-    document.addEventListener('fullscreenchange', onChange);
-    document.addEventListener('webkitfullscreenchange', onChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', onChange);
-      document.removeEventListener('webkitfullscreenchange', onChange);
-    };
-  }, []);
-
-  /* The pseudo mode has no browser-provided Esc, and the page mustn't scroll under it. */
-  useEffect(() => {
-    if (fullscreen !== 'pseudo') return;
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape') setFullscreen(null);
-    };
-    const overflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.body.style.overflow = overflow;
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [fullscreen]);
-
-  /* Fullscreen controls fade out after a few idle seconds. */
-  const wake = () => {
-    setIdle(false);
-    window.clearTimeout(idleTimer.current);
-    idleTimer.current = window.setTimeout(() => setIdle(true), CONTROLS_IDLE_MS);
-  };
-
-  useEffect(() => {
-    if (fullscreen) wake();
-    else setIdle(false);
-    return () => window.clearTimeout(idleTimer.current);
-  }, [fullscreen]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => () => window.clearTimeout(clickTimer.current), []);
-
-  /* The shield over the iframe: YouTube's own UI never sees a click, so
-     every play/pause goes through the shared state. Single click waits a
-     beat so a double click (fullscreen) doesn't pause everyone first. */
-  const onShieldClick = () => {
-    window.clearTimeout(clickTimer.current);
-    clickTimer.current = window.setTimeout(togglePlay, DOUBLE_CLICK_MS);
-  };
-
-  const onShieldDoubleClick = () => {
-    window.clearTimeout(clickTimer.current);
-    toggleFullscreen();
-  };
-
-  const onStageKey = (e: ReactKeyboardEvent) => {
-    if ((e.target as HTMLElement).closest('input, button, form')) return;
-    if (e.key === ' ' || e.key === 'k') {
-      e.preventDefault();
-      togglePlay();
-    } else if (e.key === 'f') {
-      toggleFullscreen();
-    }
-  };
-
   const hasVideo = !!shared?.videoId;
-  const shown = scrub ?? current;
   const status = shared ? describeAction(shared) : null;
   const queue = shared?.queue ?? [];
   const canSubmit = connected && !!input.trim();
@@ -464,27 +502,8 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
         )}
       </form>
 
-      <div
-        ref={stageRef}
-        className={`yt-stage${fullscreen ? ' fullscreen' : ''}${fullscreen === 'pseudo' ? ' pseudo' : ''}${fullscreen && idle && playing ? ' idle' : ''}`}
-        tabIndex={-1}
-        onKeyDown={onStageKey}
-        onPointerMove={fullscreen ? wake : undefined}
-        onPointerDown={fullscreen ? wake : undefined}
-      >
       <div className="yt-frame">
         <div ref={containerRef} className="yt-player" />
-        {hasVideo && (
-          <div
-            className={`yt-shield${playing ? '' : ' paused'}`}
-            role="button"
-            aria-label={playing ? 'Pause for everyone' : 'Play for everyone'}
-            onClick={onShieldClick}
-            onDoubleClick={onShieldDoubleClick}
-          >
-            {!playing && <span className="yt-shield-icon" aria-hidden="true">▶</span>}
-          </div>
-        )}
         {!hasVideo && (
           <div className="yt-placeholder">
             <span className="yt-placeholder-icon">📺</span>
@@ -509,26 +528,7 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
             <span className="yt-title" title={shared?.title ?? title ?? undefined}>{shared?.title ?? title ?? 'Loading…'}</span>
             {status && <span className="yt-status muted">{status}</span>}
           </div>
-          <input
-            type="range"
-            className="yt-seek"
-            min={0}
-            max={Math.max(duration, 1)}
-            step={0.5}
-            value={Math.min(shown, Math.max(duration, 1))}
-            aria-label="Seek"
-            disabled={!connected || !duration}
-            onChange={(e) => setScrub(Number(e.target.value))}
-            onPointerUp={commitScrub}
-            onKeyUp={commitScrub}
-            onBlur={() => setScrub(null)}
-          />
           <div className="yt-buttons">
-            <button className="np-btn" disabled={!connected} onClick={() => seekTo(position() - SKIP_S)} aria-label="Back 10 seconds">⏪</button>
-            <button className="np-btn np-play" disabled={!connected} onClick={togglePlay} aria-label={playing ? 'Pause' : 'Play'}>
-              {playing ? '⏸' : '▶'}
-            </button>
-            <button className="np-btn" disabled={!connected} onClick={() => seekTo(position() + SKIP_S)} aria-label="Forward 10 seconds">⏩</button>
             <button
               className="np-btn"
               disabled={!connected || queue.length === 0}
@@ -538,34 +538,13 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
             >
               ⏭
             </button>
-            <span className="np-time">{fmt(shown)} / {fmt(duration)}</span>
-            <div className="np-volume yt-volume" title="Your volume (only affects you)">
-              <span aria-hidden="true">🔉</span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                value={volume}
-                aria-label="Your YouTube volume"
-                onChange={(e) => changeVolume(Number(e.target.value))}
-              />
-            </div>
             <button className="btn" onClick={apply} title="Snap to the shared position">Resync</button>
             <button className="btn subtle" disabled={!connected} onClick={() => send({ type: 'yt:clear' })}>
               Stop for everyone
             </button>
-            <button
-              className="np-btn yt-fs-btn"
-              onClick={toggleFullscreen}
-              aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-              title={fullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen (F)'}
-            >
-              <FullscreenIcon exit={!!fullscreen} />
-            </button>
           </div>
         </div>
       )}
-      </div>
 
       {queue.length > 0 && (
         <section className="panel yt-queue">
@@ -598,8 +577,4 @@ export default function YouTubeTab({ shared, clockOffset, connected, onNotify }:
       )}
     </section>
   );
-}
-
-function setRate(player: YTPlayer, rate: number) {
-  if (player.getPlaybackRate() !== rate) player.setPlaybackRate(rate);
 }

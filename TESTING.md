@@ -59,10 +59,20 @@ also cover `App` (tabs, hash routing, the YouTube tab staying mounted,
 optimistic favourites), `SoundboardGrid`, `QueuePanel`, `AddToPlaylistMenu`
 and the `PlaylistModal` create → edit flow.
 
-`YouTubeTab` runs against a fake `window.YT.Player`. The tests cover:
+`YouTubeTab` runs against a fake `window.YT.Player` (rate events, volume and
+mute, user seeks, late-landing seeks). The tests cover:
 
-- commands sent
-- echo suppression
+- native controls (`controls: 1`, `fs: 1`, `disablekb: 0`), nothing covering
+  the iframe, and our bar keeping only skip, Resync, "Stop for everyone" and
+  the queue
+- native play/pause shared once each (including PAUSED → BUFFERING →
+  PLAYING and replay from the end screen), but not background-tab pauses
+- native seek detection, playing and paused, ahead of drift correction; not
+  triggered by `apply()`/drift seeks (even late-landing ones), buffering
+  stalls, fresh loads/cues, ads or suggested videos clicked in the embed
+- echo suppression (remote pause/play/seek never bounce back)
+- speed locked to 1× with a notice; our 0.95/1.05 nudges stay silent
+- per-person volume/mute restored on ready and saved only on change
 - ended and duration reports
 - hard seek above 1.5 s vs rate nudge between 0.3 and 1.5 s
 - the blocked-autoplay prompt
