@@ -13,28 +13,15 @@ const db = require('../db');
 const clipStore = require('../clipStore');
 const transcode = require('../transcode');
 const { requireAuth, isAdmin } = require('../auth');
+const { parseTags } = require('../tags');
 
 const router = express.Router();
 
 const MAX_CLIPS = 200;
-const MAX_TAGS = 8;
-
 const upload = multer({
   dest: db.uploadsDir,
   limits: { fileSize: config.server.limits.maxUploadBytes, files: 1 },
 });
-
-/** Normalize a comma-separated tag string to a deduped, validated array. */
-function parseTags(raw) {
-  if (typeof raw !== 'string') return [];
-  const tags = [];
-  for (const part of raw.split(',')) {
-    const tag = part.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 24);
-    if (tag && /^[\p{L}\p{N} _-]+$/u.test(tag) && !tags.includes(tag)) tags.push(tag);
-    if (tags.length >= MAX_TAGS) break;
-  }
-  return tags;
-}
 
 function toClipJson(row) {
   return {
@@ -55,6 +42,24 @@ function toClipJson(row) {
 router.get('/', requireAuth, (_req, res) => {
   res.json(db.listClips().map(toClipJson));
 });
+
+/* GET /api/clips/favorites — the caller's starred clip ids */
+router.get('/favorites', requireAuth, (req, res) => {
+  res.json(db.listFavorites(req.user.userId));
+});
+
+/* PUT / DELETE /api/clips/:id/favorite — star / unstar for the caller */
+for (const [method, favorite] of [['put', true], ['delete', false]]) {
+  router[method]('/:id/favorite', requireAuth, (req, res) => {
+    const clip = db.getClip(Number(req.params.id));
+    if (!clip) {
+      res.status(404).json({ error: 'Clip not found' });
+      return;
+    }
+    db.setFavorite(req.user.userId, clip.id, favorite);
+    res.json(db.listFavorites(req.user.userId));
+  });
+}
 
 /* GET /api/clips/:id/audio — OGG preview for the browser */
 router.get('/:id/audio', requireAuth, (req, res) => {
@@ -127,16 +132,26 @@ router.post('/', requireAuth, upload.single('file'), async (req, res) => {
     }
 
     // Insert first to get the id that names the files; roll back on failure.
-    const row = db.insertClip({
-      name,
-      emoji,
-      color,
-      tags: tags.length ? JSON.stringify(tags) : null,
-      durationMs: Math.round((end - start) * 1000),
-      uploaderId: req.user.userId,
-      uploaderName: req.user.username,
-      createdAt: Date.now(),
-    });
+    let row;
+    try {
+      row = db.insertClip({
+        name,
+        emoji,
+        color,
+        tags: tags.length ? JSON.stringify(tags) : null,
+        durationMs: Math.round((end - start) * 1000),
+        uploaderId: req.user.userId,
+        uploaderName: req.user.username,
+        createdAt: Date.now(),
+      });
+    } catch (err) {
+      // A concurrent upload took the name while this one was being probed.
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        res.status(409).json({ error: 'A clip with that name already exists' });
+        return;
+      }
+      throw err;
+    }
 
     try {
       const { durationMs } = await transcode.transcode({
@@ -191,7 +206,7 @@ router.patch('/:id', requireAuth, express.json(), (req, res) => {
     updates.emoji = String(req.body.emoji ?? '').trim().slice(0, 8) || null;
   }
   if (req.body?.tags !== undefined) {
-    const tags = parseTags(Array.isArray(req.body.tags) ? req.body.tags.join(',') : req.body.tags);
+    const tags = parseTags(req.body.tags);
     updates.tags = tags.length ? JSON.stringify(tags) : null;
   }
   if (Object.keys(updates).length === 0) {

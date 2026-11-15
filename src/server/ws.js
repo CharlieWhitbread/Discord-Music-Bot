@@ -11,10 +11,16 @@
  *                    {type:'stop'}
  *                    {type:'spotify:pause'} / {type:'spotify:resume'}
  *                    {type:'volume', value}   music-only, 0–100
+ *                    {type:'yt:load'|'yt:enqueue', videoId}  play now / add to queue
+ *                    {type:'yt:play'|'yt:pause'|'yt:seek', position}
+ *                    {type:'yt:dequeue', id} / {type:'yt:skip'} / {type:'yt:clear'}
+ *                    {type:'yt:ended', videoId} / {type:'yt:meta', videoId, duration}
  *   server → client: {type:'auth', ok, user?}
  *                    {type:'status', status}   pushed on every state change
  *                    {type:'spotify', spotify} now-playing updates
  *                    {type:'queue', queue}     bot queue updates
+ *                    {type:'playlists', playlists}  web-app playlist tiles
+ *                    {type:'youtube', youtube, serverNow}  watch-together state
  *                    {type:'error', error, clipId?}
  */
 
@@ -22,6 +28,8 @@ const { WebSocketServer } = require('ws');
 const sessionManager = require('../audio/sessionManager');
 const spotify = require('./spotify');
 const queue = require('./queue');
+const playlists = require('./playlists');
+const watch = require('./watch');
 const { resolveToken } = require('./auth');
 const { triggerClip } = require('./routes/play');
 const { pausePlayback, resumePlayback } = require('./routes/spotify');
@@ -60,11 +68,30 @@ function attach(httpServer) {
   };
   queue.events.on('update', broadcastQueue);
 
+  const broadcastPlaylists = (items) => {
+    const frame = JSON.stringify({ type: 'playlists', playlists: items });
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN && client.isAuthed) client.send(frame);
+    }
+  };
+  playlists.events.on('update', broadcastPlaylists);
+
+  // serverNow lets clients estimate clock offset for the playback anchor.
+  const youtubeFrame = (state) =>
+    JSON.stringify({ type: 'youtube', youtube: state, serverNow: Date.now() });
+  const broadcastYoutube = (state) => {
+    const frame = youtubeFrame(state);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN && client.isAuthed) client.send(frame);
+    }
+  };
+  watch.events.on('update', broadcastYoutube);
+
   // Poll Spotify only while someone is actually watching.
   const hasAuthedClient = () => [...wss.clients].some((c) => c.isAuthed);
   const spotifyPoll = setInterval(() => {
     if (!spotify.connected() || !hasAuthedClient()) return;
-    spotify.fetchNowPlaying().catch((err) => {
+    spotify.fetchNowPlaying({ maxAgeMs: 2000 }).catch((err) => {
       console.error(`[spotify] poll failed: ${err.message}`);
     });
   }, SPOTIFY_POLL_MS);
@@ -88,6 +115,9 @@ function attach(httpServer) {
       } catch {
         return;
       }
+      // `null`, numbers, strings and arrays are valid JSON too; a throw
+      // here would escape the ws receiver and wedge the socket.
+      if (!msg || typeof msg !== 'object') return;
 
       if (msg.type === 'auth') {
         const user = resolveToken(`Bearer ${msg.token}`);
@@ -103,6 +133,8 @@ function attach(httpServer) {
         const np = spotify.getLastNowPlaying();
         if (np) socket.send(JSON.stringify({ type: 'spotify', spotify: np }));
         socket.send(JSON.stringify({ type: 'queue', queue: queue.list() }));
+        socket.send(JSON.stringify({ type: 'playlists', playlists: playlists.list() }));
+        socket.send(youtubeFrame(watch.get()));
         return;
       }
 
@@ -134,6 +166,47 @@ function attach(httpServer) {
 
       if (msg.type === 'volume' && Number.isFinite(Number(msg.value))) {
         sessionManager.setMusicVolume(Number(msg.value));
+        return;
+      }
+
+      if (msg.type === 'yt:load' || msg.type === 'yt:enqueue') {
+        const run = msg.type === 'yt:load' ? watch.load : watch.enqueue;
+        run(msg.videoId, socket.user).catch((err) => {
+          if (!err.expose) console.error(`[watch] ${msg.type} failed: ${err.message}`);
+          if (socket.readyState === socket.OPEN) {
+            socket.send(JSON.stringify({ type: 'error', error: err.expose ? err.message : 'Could not load that video' }));
+          }
+        });
+        return;
+      }
+
+      if (msg.type === 'yt:play' || msg.type === 'yt:pause' || msg.type === 'yt:seek') {
+        watch.control(msg.type.slice(3), msg.position, socket.user);
+        return;
+      }
+
+      if (msg.type === 'yt:dequeue') {
+        watch.dequeue(msg.id, socket.user);
+        return;
+      }
+
+      if (msg.type === 'yt:skip') {
+        watch.skip(socket.user);
+        return;
+      }
+
+      if (msg.type === 'yt:ended') {
+        watch.ended(msg.videoId);
+        return;
+      }
+
+      if (msg.type === 'yt:meta') {
+        watch.reportDuration(msg.videoId, msg.duration);
+        return;
+      }
+
+      if (msg.type === 'yt:clear') {
+        watch.clear(socket.user);
       }
     });
 
@@ -162,6 +235,9 @@ function attach(httpServer) {
       sessionManager.events.off('status', broadcast);
       spotify.events.off('nowplaying', broadcastSpotify);
       queue.events.off('update', broadcastQueue);
+      playlists.events.off('update', broadcastPlaylists);
+      watch.events.off('update', broadcastYoutube);
+      watch.stop();
       for (const client of wss.clients) client.terminate();
       wss.close();
     },

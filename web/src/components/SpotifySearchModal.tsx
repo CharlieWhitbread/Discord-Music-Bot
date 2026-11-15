@@ -1,48 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api';
-import type { SpotifyTrack } from '../types';
+import type { Playlist, SpotifyTrack } from '../types';
+import { fmtDuration, useSpotifySearch } from '../useSpotifySearch';
+import AddToPlaylistMenu from './AddToPlaylistMenu';
 
 interface Props {
+  /** null when playlists aren't available (Spotify needs reconnecting) */
+  playlists: Playlist[] | null;
   onClose: () => void;
   onNotify: (msg: string) => void;
 }
 
-function fmtDuration(ms: number): string {
-  const s = Math.round(ms / 1000);
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-export default function SpotifySearchModal({ onClose, onNotify }: Props) {
+export default function SpotifySearchModal({ playlists, onClose, onNotify }: Props) {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<SpotifyTrack[]>([]);
-  const [searching, setSearching] = useState(false);
+  const { results, searching } = useSpotifySearch(query, onNotify);
   const [busyUri, setBusyUri] = useState<string | null>(null);
-  const debounceRef = useRef<number>();
-  const latestQuery = useRef('');
-
-  useEffect(() => {
-    window.clearTimeout(debounceRef.current);
-    const q = query.trim();
-    latestQuery.current = q;
-    if (!q) {
-      setResults([]);
-      setSearching(false);
-      return;
-    }
-    setSearching(true);
-    debounceRef.current = window.setTimeout(() => {
-      api.spotifySearch(q)
-        .then((tracks) => {
-          // Ignore responses that arrive after the query changed.
-          if (latestQuery.current === q) setResults(tracks);
-        })
-        .catch((err) => onNotify(err.message))
-        .finally(() => {
-          if (latestQuery.current === q) setSearching(false);
-        });
-    }, 350);
-    return () => window.clearTimeout(debounceRef.current);
-  }, [query, onNotify]);
 
   const act = (track: SpotifyTrack, mode: 'play' | 'queue') => {
     setBusyUri(track.uri);
@@ -97,6 +69,9 @@ export default function SpotifySearchModal({ onClose, onNotify }: Props) {
                 >
                   + Queue
                 </button>
+                {playlists && (
+                  <AddToPlaylistMenu track={track} playlists={playlists} onNotify={onNotify} />
+                )}
               </div>
             </div>
           ))}

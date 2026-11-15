@@ -48,7 +48,7 @@ function buildApp() {
   /* ── rate limits (uploads are expensive; plays are spam-able) ── */
   const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 20, standardHeaders: true });
   const playLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true });
-  const spotifyLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true });
+  const spotifyLimiter = rateLimit({ windowMs: 60 * 1000, limit: 150, standardHeaders: true });
 
   /* ── API ── */
   app.use('/api/clips', (req, res, next) => (req.method === 'POST' ? uploadLimiter(req, res, next) : next()), clipsRouter);
@@ -57,11 +57,16 @@ function buildApp() {
 
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-  // JSON errors, never stack traces.
+  // JSON errors, never stack traces. Client mistakes keep their 4xx:
+  // body-parser (malformed/oversized JSON) marks them expose, multer has
+  // its own error type.
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => {
     const status = err.message === 'Origin not allowed' ? 403
-      : err.code === 'LIMIT_FILE_SIZE' ? 413 : 500;
+      : err.code === 'LIMIT_FILE_SIZE' ? 413
+      : err.name === 'MulterError' ? 400
+      : err.expose && err.status >= 400 && err.status < 500 ? err.status
+      : 500;
     if (status === 500) console.error('[server] error:', err.message);
     res.status(status).json({ error: status === 500 ? 'Internal error' : err.message });
   });

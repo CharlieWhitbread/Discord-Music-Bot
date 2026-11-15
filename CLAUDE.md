@@ -16,9 +16,12 @@ soundboard design and milestones.
 npm install          # install deps
 npm start            # run the bot (node src/index.js)
 npm run deploy       # register slash commands (once, or after changing them)
+npm test             # server tests (node:test, fakes for Spotify/Discord/voice)
+npm run test:web     # web tests (Vitest + Testing Library, in web/)
 ```
 
-No test suite or linter is configured. Node ≥ 18, CommonJS (`'use strict'`,
+Tests need Node ≥ 22 (the bot itself runs on Node ≥ 18); see
+[TESTING.md](TESTING.md). No linter is configured. CommonJS (`'use strict'`,
 `require`), plain JavaScript — no TypeScript in `src/`. The planned React app
 in `web/` will be Vite + TypeScript.
 
@@ -74,14 +77,34 @@ but is gain-ramped to silence (60 ms fade), then blended back in.
   LRU cache), `transcode.js` (serial ffmpeg queue: trim + loudnorm → PCM +
   OGG preview), `auth.js` (Discord OAuth2 → bearer tokens, guild gate),
   `routes/clips.js`, `routes/play.js`, `ws.js` (primary play channel),
+  `watch.js` (YouTube watch-together state: video id + position anchor at
+  a server timestamp, plus the shared "up next" queue — oEmbed for titles
+  and to reject non-embeddable videos; advances on the first client
+  "ended" report or a server timer from the client-reported duration;
+  no video passes through the Pi),
+  `spotify.js` (Web API client: owner's OAuth token, retries, now-playing,
+  playlist endpoints — Feb 2026 API: `POST /me/playlists`,
+  `/playlists/{id}/items`, delete = `DELETE /me/library`),
+  `queue.js` (bot queue; hands each song to Spotify's *native* queue ~15 s
+  before the current track ends so a playing playlist context survives;
+  all player operations are serialised), `playlists.js` (web-app
+  playlists = real private Spotify playlists, tile metadata in SQLite;
+  only these are ever listed; played as the context with shuffle),
   `server.js` (CORS pinned to WEB_ORIGIN, helmet, rate limits).
-- `web/` — React soundboard (Vite + TS): login, tile grid, upload modal
-  with WaveSurfer trim, WebSocket with HTTP fallback. Deployed to Azure
+- `web/` — React app (Vite + TS) with three tabs (Soundboard / Spotify /
+  YouTube, active tab in the URL hash): login, tile grid, upload modal
+  with WaveSurfer trim, WebSocket with HTTP fallback. Inactive tabs stay
+  mounted offscreen so a YouTube video keeps playing. The YouTube tab
+  embeds the IFrame Player in each browser (own YouTube/Premium session)
+  and syncs play/pause/seek over the WebSocket with drift correction.
+  Deployed to Azure
   Static Web Apps via `.github/workflows/deploy-web.yml`.
 - `scripts/make-test-clip.js` (`npm run test-clip`) — generates a 2 s chime
   clip named `test` for end-to-end verification.
 - Clips stored as pre-transcoded **raw s16le/48 kHz/stereo PCM** (+ OGG
   preview) under `data/clips/`, metadata in SQLite (`data/soundboard.db`).
+  Favourites are per Discord user in SQLite (`clip_favorites`); "Recent" is
+  per device in localStorage (`web/src/recent.ts`).
 
 ## Critical invariants — do not break these
 

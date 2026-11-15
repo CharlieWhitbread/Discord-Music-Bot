@@ -1,6 +1,6 @@
 import { API_BASE } from './config';
 import { clearToken, getToken } from './auth';
-import type { BotStatus, Clip, QueueEntry, SpotifyStatus, SpotifyTrack, User } from './types';
+import type { BotStatus, Clip, Playlist, QueueEntry, SpotifyStatus, SpotifyTrack, User } from './types';
 
 class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -37,6 +37,9 @@ export const api = {
   play: (clipId: number) => request<{ ok: true }>(`/api/play/${clipId}`, { method: 'POST' }),
   stop: () => request<{ ok: true }>('/api/stop', { method: 'POST' }),
   deleteClip: (clipId: number) => request<void>(`/api/clips/${clipId}`, { method: 'DELETE' }),
+  favorites: () => request<number[]>('/api/clips/favorites'),
+  setFavorite: (clipId: number, favorite: boolean) =>
+    request<number[]>(`/api/clips/${clipId}/favorite`, { method: favorite ? 'PUT' : 'DELETE' }),
   updateClip: (clipId: number, fields: { name?: string; emoji?: string; tags?: string }) =>
     request<Clip>(`/api/clips/${clipId}`, {
       method: 'PATCH',
@@ -76,6 +79,38 @@ export const api = {
     }),
   spotifyControl: (action: 'pause' | 'resume' | 'next' | 'previous') =>
     request<{ ok: true }>(`/api/spotify/${action}`, { method: 'POST' }),
+
+  /* ── web-app playlists ── */
+  playlists: () => request<Playlist[]>('/api/spotify/playlists'),
+  createPlaylist: (fields: PlaylistFields) =>
+    request<Playlist>('/api/spotify/playlists', json('POST', fields)),
+  updatePlaylist: (id: number, fields: Partial<PlaylistFields>) =>
+    request<Playlist>(`/api/spotify/playlists/${id}`, json('PATCH', fields)),
+  deletePlaylist: (id: number) =>
+    request<void>(`/api/spotify/playlists/${id}`, { method: 'DELETE' }),
+  playlistTracks: (id: number) =>
+    request<SpotifyTrack[]>(`/api/spotify/playlists/${id}/tracks`),
+  addPlaylistTrack: (id: number, uri: string) =>
+    request<SpotifyTrack>(`/api/spotify/playlists/${id}/tracks`, json('POST', { uri })),
+  removePlaylistTrack: (id: number, uri: string) =>
+    request<{ ok: true }>(`/api/spotify/playlists/${id}/tracks`, json('DELETE', { uri })),
+  playPlaylist: (id: number) =>
+    request<{ ok: true }>(`/api/spotify/playlists/${id}/play`, { method: 'POST' }),
 };
+
+export interface PlaylistFields {
+  name: string;
+  emoji: string;
+  tags: string;
+  shuffle: boolean;
+}
+
+function json(method: string, body: unknown): RequestInit {
+  return {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
 
 export { ApiError };

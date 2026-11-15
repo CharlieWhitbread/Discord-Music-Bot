@@ -42,6 +42,8 @@ export interface SpotifyState {
   progressMs?: number;
   fetchedAt?: number;
   onOurDevice?: boolean;
+  shuffle?: boolean;
+  context?: { type: string; uri: string } | null;
   track?: SpotifyTrack;
 }
 
@@ -49,6 +51,8 @@ export interface SpotifyStatus {
   configured: boolean;
   connected: boolean;
   canConnect: boolean;
+  /** false until an admin re-links Spotify with the playlist scopes */
+  playlists: boolean;
 }
 
 export interface QueueEntry {
@@ -56,4 +60,44 @@ export interface QueueEntry {
   track: SpotifyTrack;
   addedBy: { userId: string; username: string };
   addedAt: number;
+  /** already handed to Spotify — plays next, can't be removed */
+  locked?: boolean;
 }
+
+export interface Playlist {
+  id: number;
+  spotifyId: string;
+  name: string;
+  emoji: string | null;
+  tags: string[];
+  shuffle: boolean;
+  trackCount: number;
+  creatorId: string;
+  creatorName: string;
+  playCount: number;
+  createdAt: number;
+}
+
+export interface QueuedVideo {
+  id: number;
+  videoId: string;
+  title: string | null;
+  addedBy: { userId: string; username: string } | null;
+  addedAt: number;
+}
+
+/** Shared watch-together state; position is in seconds as of updatedAt (server clock). */
+export interface YouTubeState {
+  videoId: string | null;
+  title: string | null;
+  /** seconds, once a viewer's player has reported it */
+  duration: number | null;
+  playing: boolean;
+  position: number;
+  updatedAt: number;
+  by: { userId: string; username: string } | null;
+  action: 'load' | 'play' | 'pause' | 'seek' | 'clear' | 'enqueue' | 'dequeue' | 'skip' | 'advance' | 'ended' | null;
+  queue: QueuedVideo[];
+}
+
+export type TabId = 'soundboard' | 'spotify' | 'youtube';

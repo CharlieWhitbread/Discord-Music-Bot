@@ -1,21 +1,38 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api';
 import { ADMIN_USER } from './config';
 import { captureTokenFromUrl, clearToken, getToken, setDevToken } from './auth';
 import * as ws from './ws';
-import type { BotStatus, Clip, ConnectionState, QueueEntry, SpotifyState, SpotifyStatus, User } from './types';
+import type {
+  BotStatus, Clip, ConnectionState, Playlist, QueueEntry, SpotifyState, SpotifyStatus, TabId, User, YouTubeState,
+} from './types';
 import { formatTag } from './format';
+import { loadRecent, pushRecent } from './recent';
 import Login from './components/Login';
 import StatusBanner from './components/StatusBanner';
 import SoundboardGrid from './components/SoundboardGrid';
 import UploadModal from './components/UploadModal';
 import EditClipModal from './components/EditClipModal';
-import NowPlayingBar from './components/NowPlayingBar';
-import SpotifySearchModal from './components/SpotifySearchModal';
-import QueuePanel from './components/QueuePanel';
+import SpotifyTab from './components/SpotifyTab';
+import YouTubeTab from './components/YouTubeTab';
+
+const TABS: { id: TabId; label: string; icon: string }[] = [
+  { id: 'soundboard', label: 'Soundboard', icon: '🔊' },
+  { id: 'spotify', label: 'Spotify', icon: '🎵' },
+  { id: 'youtube', label: 'YouTube', icon: '📺' },
+];
+
+function tabFromHash(): TabId {
+  const id = window.location.hash.slice(1);
+  return TABS.some((t) => t.id === id) ? (id as TabId) : 'soundboard';
+}
 
 export default function App() {
   const [loginError] = useState<string | null>(() => captureTokenFromUrl());
+  const [tab, setTab] = useState<TabId>(tabFromHash);
+  // The YouTube player mounts on first visit, then stays alive so the video
+  // keeps playing while you use the other tabs.
+  const [youtubeMounted, setYoutubeMounted] = useState(() => tabFromHash() === 'youtube');
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -28,13 +45,36 @@ export default function App() {
   const [activeTags, setActiveTags] = useState<string[]>([]);
   const [spotify, setSpotify] = useState<SpotifyState | null>(null);
   const [spotifyStatus, setSpotifyStatus] = useState<SpotifyStatus | null>(null);
-  const [showSongSearch, setShowSongSearch] = useState(false);
   const [queue, setQueue] = useState<QueueEntry[]>([]);
-  const [showQueue, setShowQueue] = useState(false);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [youtube, setYoutube] = useState<YouTubeState | null>(null);
+  const [clockOffset, setClockOffset] = useState(0);
+  const [favoriteIds, setFavoriteIds] = useState<number[]>([]);
+  const [recentIds, setRecentIds] = useState<number[]>(loadRecent);
 
+  const selectTab = useCallback((next: TabId) => {
+    setTab(next);
+    if (next === 'youtube') setYoutubeMounted(true);
+    if (window.location.hash !== `#${next}`) window.location.hash = next;
+  }, []);
+
+  /* Back/forward buttons move between tabs. */
+  useEffect(() => {
+    const onHash = () => {
+      const next = tabFromHash();
+      setTab(next);
+      if (next === 'youtube') setYoutubeMounted(true);
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const toastTimer = useRef<number>();
   const notify = useCallback((msg: string) => {
     setToast(msg);
-    window.setTimeout(() => setToast(null), 4000);
+    // Restart the timer so an older toast's timeout can't clear a newer one.
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4000);
   }, []);
 
   const refreshClips = useCallback(() => {
@@ -52,6 +92,8 @@ export default function App() {
         api.status().then(setStatus).catch(() => {});
         api.spotifyStatus().then(setSpotifyStatus).catch(() => {});
         api.spotifyQueueList().then(setQueue).catch(() => {});
+        api.playlists().then(setPlaylists).catch(() => {});
+        api.favorites().then(setFavoriteIds).catch(() => {});
       })
       .catch(() => {})
       .finally(() => setAuthChecked(true));
@@ -62,7 +104,7 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const result = params.get('spotify');
     if (!result) return;
-    window.history.replaceState(null, '', window.location.pathname);
+    window.history.replaceState(null, '', window.location.pathname + window.location.hash);
     notify(result === 'connected' ? 'Spotify connected!' : 'Spotify connection failed');
   }, [notify]);
 
@@ -76,6 +118,11 @@ export default function App() {
       onError: notify,
       onSpotify: setSpotify,
       onQueue: setQueue,
+      onPlaylists: setPlaylists,
+      onYoutube: (state, offset) => {
+        setYoutube(state);
+        setClockOffset(offset);
+      },
     });
     return () => {
       unsubscribe();
@@ -84,10 +131,23 @@ export default function App() {
   }, [user, notify]);
 
   const playClip = useCallback((clip: Clip) => {
+    setRecentIds((cur) => pushRecent(cur, clip.id));
     if (!ws.sendPlay(clip.id)) {
       api.play(clip.id).catch((err) => notify(err.message));
     }
   }, [notify]);
+
+  const toggleFavorite = useCallback((clip: Clip) => {
+    const favorite = !favoriteIds.includes(clip.id);
+    // Optimistic: star instantly, reconcile with the server's list.
+    setFavoriteIds((cur) => (favorite ? [...cur, clip.id] : cur.filter((id) => id !== clip.id)));
+    api.setFavorite(clip.id, favorite)
+      .then(setFavoriteIds)
+      .catch((err) => {
+        setFavoriteIds((cur) => (favorite ? cur.filter((id) => id !== clip.id) : [...cur, clip.id]));
+        notify(err.message);
+      });
+  }, [favoriteIds, notify]);
 
   const stopClip = useCallback(() => {
     if (!ws.sendStop()) {
@@ -121,49 +181,103 @@ export default function App() {
     );
   }, [clips, query, activeTags]);
 
+  const favoriteSet = useMemo(() => new Set(favoriteIds), [favoriteIds]);
+  const clipsById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
+  const pick = (ids: number[]) => ids.map((id) => clipsById.get(id)).filter((c): c is Clip => !!c);
+  const favoriteClips = pick(favoriteIds);
+  const recentClips = pick(recentIds);
+  // Quick-access rows only make sense on the unfiltered board.
+  const filtering = query.trim() !== '' || activeTags.length > 0;
+
   if (!authChecked) return null;
 
   if (!user) {
     return <Login error={loginError} />;
   }
 
+  const spotifyPlaying = !!(spotify?.active && spotify.isPlaying);
+  const youtubeLive = !!(youtube?.videoId && youtube.playing);
+  const tabBadge: Record<TabId, boolean> = {
+    soundboard: !!status?.clip,
+    spotify: spotifyPlaying,
+    youtube: youtubeLive,
+  };
+
+  const onTabKey = (e: KeyboardEvent, index: number) => {
+    if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+    const delta = e.key === 'ArrowRight' ? 1 : -1;
+    const next = TABS[(index + delta + TABS.length) % TABS.length];
+    selectTab(next.id);
+    document.getElementById(`tab-${next.id}`)?.focus();
+  };
+
   return (
-    <div className={`app${spotifyStatus?.configured ? ' has-npbar' : ''}`}>
+    <div className="app">
       <header className="topbar">
         <div className="brand">
           <span className="brand-logo">🎉</span>
           <div>
             <h1>Mr Blobby</h1>
-            <span className="brand-sub">Soundboard</span>
+            <span className="brand-sub">{TABS.find((t) => t.id === tab)?.label}</span>
           </div>
         </div>
-        <div className="topbar-actions">
-          <button className="btn primary" onClick={() => setShowUpload(true)}>+ Add clip</button>
-          <button className="btn" onClick={stopClip}>Stop</button>
-          <div className="userchip">
-            {user.avatar && <img src={user.avatar} alt="" />}
-            <span>{user.username}</span>
+        <nav className="tabs" role="tablist" aria-label="Sections">
+          {TABS.map((t, i) => (
             <button
-              className="btn subtle"
-              onClick={() => { clearToken(); window.location.reload(); }}
+              key={t.id}
+              id={`tab-${t.id}`}
+              role="tab"
+              aria-selected={tab === t.id}
+              aria-controls={`panel-${t.id}`}
+              tabIndex={tab === t.id ? 0 : -1}
+              className={`tab${tab === t.id ? ' active' : ''}`}
+              onClick={() => selectTab(t.id)}
+              onKeyDown={(e) => onTabKey(e, i)}
             >
-              Sign out
+              <span aria-hidden="true">{t.icon}</span>
+              <span className="tab-label">{t.label}</span>
+              {tabBadge[t.id] && <span className="tab-live" title="Active" />}
             </button>
-          </div>
+          ))}
+        </nav>
+        <div className="userchip">
+          {user.avatar && <img src={user.avatar} alt="" />}
+          <span>{user.username}</span>
+          <button
+            className="btn subtle"
+            onClick={() => { clearToken(); window.location.reload(); }}
+          >
+            Sign out
+          </button>
         </div>
       </header>
 
-      <StatusBanner status={status} wsState={wsState} />
+      {/* YouTube audio is local to each browser, so the bot's voice status
+          only matters there when the socket itself is down. */}
+      {(tab !== 'youtube' || wsState !== 'open') && (
+        <StatusBanner status={status} wsState={wsState} />
+      )}
 
-      {(clips.length > 0) && (
+      <div
+        id="panel-soundboard"
+        role="tabpanel"
+        aria-labelledby="tab-soundboard"
+        className={`tab-panel${tab === 'soundboard' ? '' : ' inactive'}`}
+      >
         <div className="filter-bar">
-          <input
-            type="search"
-            className="search-input"
-            placeholder="Search clips…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
+          <div className="toolbar">
+            {clips.length > 0 && (
+              <input
+                type="search"
+                className="search-input"
+                placeholder="Search clips…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+            )}
+            <button className="btn primary" onClick={() => setShowUpload(true)}>+ Add clip</button>
+            <button className="btn" onClick={stopClip}>Stop</button>
+          </div>
           {allTags.length > 0 && (
             <div className="tag-chips">
               {allTags.map((tag) => (
@@ -183,19 +297,79 @@ export default function App() {
             </div>
           )}
         </div>
-      )}
 
-      <SoundboardGrid
-        clips={visibleClips}
-        nowPlayingId={status?.clip?.id ?? null}
-        disabled={!status?.inVoice}
-        currentUserId={user.userId}
-        isAdmin={ADMIN_USER != null && user.userId === ADMIN_USER}
-        onPlay={playClip}
-        onEdit={setEditClip}
-        onDelete={deleteClip}
-        emptyMessage={clips.length > 0 ? 'No clips match your search' : undefined}
-      />
+        {!filtering && ([
+          ['★ Favourites', favoriteClips],
+          ['🕘 Recent', recentClips],
+        ] as const).map(([heading, list]) => list.length > 0 && (
+          <section key={heading} className="board-section">
+            <h2>{heading}</h2>
+            <SoundboardGrid
+              clips={list}
+              nowPlayingId={status?.clip?.id ?? null}
+              disabled={!status?.inVoice}
+              currentUserId={user.userId}
+              isAdmin={ADMIN_USER != null && user.userId === ADMIN_USER}
+              favoriteIds={favoriteSet}
+              onPlay={playClip}
+              onEdit={setEditClip}
+              onDelete={deleteClip}
+              onToggleFavorite={toggleFavorite}
+            />
+          </section>
+        ))}
+
+        <section className="board-section">
+          {!filtering && (favoriteClips.length > 0 || recentClips.length > 0) && <h2>All clips</h2>}
+          <SoundboardGrid
+            clips={visibleClips}
+            nowPlayingId={status?.clip?.id ?? null}
+            disabled={!status?.inVoice}
+            currentUserId={user.userId}
+            isAdmin={ADMIN_USER != null && user.userId === ADMIN_USER}
+            favoriteIds={favoriteSet}
+            onPlay={playClip}
+            onEdit={setEditClip}
+            onDelete={deleteClip}
+            onToggleFavorite={toggleFavorite}
+            emptyMessage={clips.length > 0 ? 'No clips match your search' : undefined}
+          />
+        </section>
+      </div>
+
+      <div
+        id="panel-spotify"
+        role="tabpanel"
+        aria-labelledby="tab-spotify"
+        className={`tab-panel${tab === 'spotify' ? '' : ' inactive'}`}
+      >
+        <SpotifyTab
+          user={user}
+          isAdmin={ADMIN_USER != null && user.userId === ADMIN_USER}
+          status={status}
+          spotify={spotify}
+          spotifyStatus={spotifyStatus}
+          queue={queue}
+          playlists={playlists}
+          onNotify={notify}
+        />
+      </div>
+
+      <div
+        id="panel-youtube"
+        role="tabpanel"
+        aria-labelledby="tab-youtube"
+        className={`tab-panel${tab === 'youtube' ? '' : ' inactive'}`}
+      >
+        {youtubeMounted && (
+          <YouTubeTab
+            shared={youtube}
+            clockOffset={clockOffset}
+            connected={wsState === 'open'}
+            onNotify={notify}
+          />
+        )}
+      </div>
 
       {showUpload && (
         <UploadModal
@@ -211,32 +385,6 @@ export default function App() {
           onSaved={() => { setEditClip(null); refreshClips(); }}
         />
       )}
-
-      {showSongSearch && (
-        <SpotifySearchModal
-          onClose={() => setShowSongSearch(false)}
-          onNotify={notify}
-        />
-      )}
-
-      {showQueue && (
-        <QueuePanel
-          queue={queue}
-          onClose={() => setShowQueue(false)}
-          onAddSongs={() => { setShowQueue(false); setShowSongSearch(true); }}
-          onNotify={notify}
-        />
-      )}
-
-      <NowPlayingBar
-        spotify={spotify}
-        status={spotifyStatus}
-        musicVolume={status?.musicVolume ?? 100}
-        queueCount={queue.length}
-        onSearch={() => setShowSongSearch(true)}
-        onQueue={() => setShowQueue(true)}
-        onError={notify}
-      />
 
       {toast && <div className="toast">{toast}</div>}
     </div>

@@ -11,9 +11,11 @@ export default function SoundboardGrid({
   disabled,
   currentUserId,
   isAdmin,
+  favoriteIds,
   onPlay,
   onEdit,
   onDelete,
+  onToggleFavorite,
   emptyMessage = 'No clips yet — add the first one!',
 }: {
   clips: Clip[];
@@ -21,9 +23,11 @@ export default function SoundboardGrid({
   disabled: boolean;
   currentUserId: string;
   isAdmin: boolean;
+  favoriteIds: Set<number>;
   onPlay: (clip: Clip) => void;
   onEdit: (clip: Clip) => void;
   onDelete: (clip: Clip) => void;
+  onToggleFavorite: (clip: Clip) => void;
   emptyMessage?: string;
 }) {
   if (clips.length === 0) {
@@ -35,10 +39,11 @@ export default function SoundboardGrid({
       {clips.map((clip) => (
         <button
           key={clip.id}
-          className={`tile${nowPlayingId === clip.id ? ' playing' : ''}`}
+          className={`tile${nowPlayingId === clip.id ? ' playing' : ''}${disabled ? ' unavailable' : ''}`}
           style={clip.color ? { borderColor: clip.color } : undefined}
-          disabled={disabled}
-          onClick={() => onPlay(clip)}
+          // Not `disabled`: that would also swallow clicks on the star/edit icons.
+          aria-disabled={disabled}
+          onClick={() => { if (!disabled) onPlay(clip); }}
           title={`${clip.name} · ${formatDuration(clip.durationMs)} · by ${clip.uploaderName}`}
         >
           <span className="tile-emoji">{clip.emoji ?? '🔊'}</span>
@@ -52,6 +57,15 @@ export default function SoundboardGrid({
           )}
           <span className="tile-meta">
             {formatDuration(clip.durationMs)} · {clip.playCount} ▶
+          </span>
+          <span
+            className={`tile-fav${favoriteIds.has(clip.id) ? ' on' : ''}`}
+            role="button"
+            aria-pressed={favoriteIds.has(clip.id)}
+            title={favoriteIds.has(clip.id) ? 'Remove from favourites' : 'Add to favourites'}
+            onClick={(e) => { e.stopPropagation(); onToggleFavorite(clip); }}
+          >
+            {favoriteIds.has(clip.id) ? '★' : '☆'}
           </span>
           {(isAdmin || clip.uploaderId === currentUserId) && (
             <>

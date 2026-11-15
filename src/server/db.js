@@ -41,6 +41,30 @@ db.exec(`
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
+
+  -- Only playlists created through the web app; the linked account's
+  -- other playlists are deliberately never listed.
+  CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spotify_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    emoji TEXT,
+    tags TEXT,
+    shuffle INTEGER NOT NULL DEFAULT 0,
+    track_count INTEGER NOT NULL DEFAULT 0,
+    creator_id TEXT NOT NULL,
+    creator_name TEXT NOT NULL,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+
+  -- Per-user starred clips (server-side so they follow you across devices).
+  CREATE TABLE IF NOT EXISTS clip_favorites (
+    user_id TEXT NOT NULL,
+    clip_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, clip_id)
+  );
 `);
 
 // Migration for databases created before tags existed.
@@ -61,6 +85,12 @@ const stmts = {
   getClipByName: db.prepare('SELECT * FROM clips WHERE name = ? COLLATE NOCASE'),
   searchClipByName: db.prepare("SELECT * FROM clips WHERE name LIKE ? COLLATE NOCASE ORDER BY play_count DESC LIMIT 1"),
   deleteClip: db.prepare('DELETE FROM clips WHERE id = ?'),
+  deleteClipFavorites: db.prepare('DELETE FROM clip_favorites WHERE clip_id = ?'),
+  listFavorites: db.prepare('SELECT clip_id FROM clip_favorites WHERE user_id = ? ORDER BY created_at'),
+  addFavorite: db.prepare(`
+    INSERT OR IGNORE INTO clip_favorites (user_id, clip_id, created_at) VALUES (?, ?, ?)
+  `),
+  removeFavorite: db.prepare('DELETE FROM clip_favorites WHERE user_id = ? AND clip_id = ?'),
   bumpPlayCount: db.prepare('UPDATE clips SET play_count = play_count + 1 WHERE id = ?'),
   countClips: db.prepare('SELECT COUNT(*) AS n FROM clips'),
   updateClipMeta: db.prepare('UPDATE clips SET name = @name, emoji = @emoji, tags = @tags WHERE id = @id'),
@@ -85,7 +115,18 @@ function findClipByName(name) {
 }
 
 function deleteClip(id) {
+  stmts.deleteClipFavorites.run(id);
   return stmts.deleteClip.run(id).changes > 0;
+}
+
+/** @returns {number[]} the user's starred clip ids, oldest star first */
+function listFavorites(userId) {
+  return stmts.listFavorites.all(userId).map((r) => r.clip_id);
+}
+
+function setFavorite(userId, clipId, favorite) {
+  if (favorite) stmts.addFavorite.run(userId, clipId, Date.now());
+  else stmts.removeFavorite.run(userId, clipId);
 }
 
 function bumpPlayCount(id) {
@@ -123,6 +164,52 @@ function purgeExpiredTokens() {
   tokenStmts.purge.run(Date.now());
 }
 
+/* ─────────────────────────── playlists ─────────────────────────── */
+
+const playlistStmts = {
+  insert: db.prepare(`
+    INSERT INTO playlists (spotify_id, name, emoji, tags, shuffle, creator_id, creator_name, created_at)
+    VALUES (@spotifyId, @name, @emoji, @tags, @shuffle, @creatorId, @creatorName, @createdAt)
+  `),
+  list: db.prepare('SELECT * FROM playlists ORDER BY created_at DESC'),
+  get: db.prepare('SELECT * FROM playlists WHERE id = ?'),
+  update: db.prepare(`
+    UPDATE playlists SET name = @name, emoji = @emoji, tags = @tags, shuffle = @shuffle WHERE id = @id
+  `),
+  setTrackCount: db.prepare('UPDATE playlists SET track_count = ? WHERE id = ?'),
+  bumpPlayCount: db.prepare('UPDATE playlists SET play_count = play_count + 1 WHERE id = ?'),
+  delete: db.prepare('DELETE FROM playlists WHERE id = ?'),
+};
+
+function insertPlaylist(fields) {
+  const info = playlistStmts.insert.run(fields);
+  return playlistStmts.get.get(info.lastInsertRowid);
+}
+
+function listPlaylists() {
+  return playlistStmts.list.all();
+}
+
+function getPlaylist(id) {
+  return playlistStmts.get.get(id);
+}
+
+function updatePlaylist(id, fields) {
+  playlistStmts.update.run({ id, ...fields });
+}
+
+function setPlaylistTrackCount(id, count) {
+  playlistStmts.setTrackCount.run(count, id);
+}
+
+function bumpPlaylistPlayCount(id) {
+  playlistStmts.bumpPlayCount.run(id);
+}
+
+function deletePlaylist(id) {
+  return playlistStmts.delete.run(id).changes > 0;
+}
+
 module.exports = {
   db,
   dataDir,
@@ -133,10 +220,19 @@ module.exports = {
   getClip,
   findClipByName,
   deleteClip,
+  listFavorites,
+  setFavorite,
   bumpPlayCount,
   updateClipMeta,
   countClips,
   insertToken,
   getToken,
   purgeExpiredTokens,
+  insertPlaylist,
+  listPlaylists,
+  getPlaylist,
+  updatePlaylist,
+  setPlaylistTrackCount,
+  bumpPlaylistPlayCount,
+  deletePlaylist,
 };

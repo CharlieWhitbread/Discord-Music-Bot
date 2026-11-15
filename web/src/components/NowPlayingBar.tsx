@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import * as ws from '../ws';
-import type { SpotifyState, SpotifyStatus } from '../types';
+import type { Playlist, SpotifyState, SpotifyStatus } from '../types';
+import AddToPlaylistMenu from './AddToPlaylistMenu';
 
 interface Props {
   spotify: SpotifyState | null;
   status: SpotifyStatus | null;
   musicVolume: number;
-  queueCount: number;
+  /** web-app playlist currently playing as the context, if any */
+  context: Playlist | null;
+  /** null when playlists aren't available (Spotify needs reconnecting) */
+  playlists: Playlist[] | null;
   onSearch: () => void;
-  onQueue: () => void;
   onError: (msg: string) => void;
 }
 
@@ -21,7 +24,7 @@ function fmtTime(ms: number): string {
 const VOLUME_THROTTLE_MS = 150;
 
 export default function NowPlayingBar({
-  spotify, status, musicVolume, queueCount, onSearch, onQueue, onError,
+  spotify, status, musicVolume, context, playlists, onSearch, onError,
 }: Props) {
   // Interpolate progress locally between server pushes.
   const [now, setNow] = useState(Date.now());
@@ -106,7 +109,7 @@ export default function NowPlayingBar({
   const pct = track && track.durationMs > 0 ? (progressMs / track.durationMs) * 100 : 0;
 
   return (
-    <div className="nowplaying-bar">
+    <div className="nowplaying-card">
       <div className="np-progress"><div className="np-progress-fill" style={{ width: `${pct}%` }} /></div>
       <div className="np-inner">
         {track ? (
@@ -117,7 +120,11 @@ export default function NowPlayingBar({
             <div className="np-meta">
               <span className="np-title" title={track.name}>{track.name}</span>
               <span className="np-artist" title={track.artists}>{track.artists}</span>
-              <span className="np-time">{fmtTime(progressMs)} / {fmtTime(track.durationMs)}</span>
+              <span className="np-time">
+                {fmtTime(progressMs)} / {fmtTime(track.durationMs)}
+                {context && ` · from ${context.emoji ?? '🎵'} ${context.name}`}
+                {context && spotify?.shuffle && ' 🔀'}
+              </span>
             </div>
           </>
         ) : (
@@ -157,9 +164,16 @@ export default function NowPlayingBar({
                   onChange={(e) => changeVolume(Number(e.target.value))}
                 />
               </div>
-              <button className="btn np-queue" onClick={onQueue}>
-                Queue{queueCount > 0 ? ` (${queueCount})` : ''}
-              </button>
+              {track && playlists && (
+                <AddToPlaylistMenu
+                  key={track.uri}
+                  track={track}
+                  playlists={playlists}
+                  onNotify={onError}
+                  label="♡ Save"
+                  className="btn np-save"
+                />
+              )}
               <button className="btn np-search" onClick={onSearch}>🔍 Songs</button>
             </>
           ) : status.canConnect ? (
